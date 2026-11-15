@@ -34,9 +34,9 @@ env:
   CAPABILITIES: applier-branch-namespace
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
-  # fullsend with the emulator job (run-job.sh BT_SUITE=agents).
+  # fullsend reliability base d082258ed + run-job.sh BT_SUITE=agents.
   FULLSEND_REPO: waynesun09/fullsend
-  FULLSEND_REF: 14442e2b13eafa02a8d443f23c1209f160c02cee
+  FULLSEND_REF: ce55926346873cf23dc79502ff968f129836e908
   # waynesun09/github-emulator ci-self-contained, as pinned by that fullsend ref.
   EMULATOR_REPO: waynesun09/github-emulator
   EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
