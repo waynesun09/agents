@@ -56,6 +56,9 @@ jobs:
           repository: ${{ env.FULLSEND_REPO }}
           ref: ${{ env.FULLSEND_REF }}
           path: .fullsend
+          # Full history: run-job.sh pushes it into the emulator, which
+          # refuses a shallow push.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Checkout github-emulator
