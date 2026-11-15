@@ -1,0 +1,110 @@
+name: behaviour-emulator
+
+# This repository's behaviour suite (behaviour/features) against a GitHub
+# emulator inside this one job: no repository secrets, no environment, no
+# OIDC to a real cloud. Every credential (emulator admin token, App keys,
+# mint) is made for the run. The stack and the run script come from a
+# pinned fullsend checkout; this checkout is pushed into the emulator as
+# fullsend-ai/agents, so every slot runs the agents under test.
+
+on:
+  # The base branch itself: its pushes and re-runs are the control runs.
+  push:
+    branches: [bt-rel-base]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: Scenarios in parallel (slot pool size and godog concurrency; empty uses DEFAULT_WORKERS)
+      runners:
+        description: Real actions/runner processes on the emulator (empty uses DEFAULT_RUNNERS)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: behaviour-emulator-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Makefile's default capabilities, as the live job runs them.
+  CAPABILITIES: applier-branch-namespace,review-skill-overrides
+  DEFAULT_WORKERS: "6"
+  DEFAULT_RUNNERS: "12"
+  # fullsend with the emulator job (run-job.sh BT_SUITE=agents).
+  FULLSEND_REPO: waynesun09/fullsend
+  FULLSEND_REF: 14442e2b13eafa02a8d443f23c1209f160c02cee
+  # waynesun09/github-emulator ci-self-contained, as pinned by that fullsend ref.
+  EMULATOR_REPO: waynesun09/github-emulator
+  EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
+
+jobs:
+  behaviour-emulator:
+    name: behaviour-emulator (agents)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout agents
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout fullsend
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.FULLSEND_REPO }}
+          ref: ${{ env.FULLSEND_REF }}
+          path: .fullsend
+          persist-credentials: false
+
+      - name: Checkout github-emulator
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.EMULATOR_REPO }}
+          ref: ${{ env.EMULATOR_REF }}
+          path: .emulator
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: .fullsend/go.mod
+          cache-dependency-path: |
+            go.sum
+            .fullsend/go.sum
+
+      - name: Install emulator dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/emu-venv"
+          "$RUNNER_TEMP/emu-venv/bin/pip" install -q -r .emulator/requirements.txt
+
+      - name: Run the agents behaviour suite
+        env:
+          EMULATOR_DIR: ${{ github.workspace }}/.emulator
+          EMULATOR_PY: ${{ runner.temp }}/emu-venv/bin/python
+          STATE_DIR: ${{ runner.temp }}/bt-emulator
+          # Read-only job token, only so the emulator can fetch public
+          # github.com actions without the anonymous rate limit.
+          UPSTREAM_TOKEN: ${{ github.token }}
+          BT_SUITE: agents
+          AGENTS_DIR: ${{ github.workspace }}
+          BEHAVIOUR_CAPABILITIES: ${{ env.CAPABILITIES }}
+          WORKERS: ${{ inputs.workers || env.DEFAULT_WORKERS }}
+          EMULATOR_RUNNERS: ${{ inputs.runners || env.DEFAULT_RUNNERS }}
+        run: |
+          export BEHAVIOUR_POOL_SIZE="$WORKERS" GODOG_CONCURRENCY="$WORKERS"
+          .fullsend/e2e/behaviour/emulator/run-job.sh
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: behaviour-emulator-logs-agents
+          path: |
+            ${{ runner.temp }}/bt-emulator/**/*.log
+            ${{ runner.temp }}/bt-emulator/phases.tsv
+            ${{ runner.temp }}/bt-emulator/emulator-profile.json
+            ${{ runner.temp }}/bt-emulator/bt-artifacts/
+            !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
+          if-no-files-found: warn
