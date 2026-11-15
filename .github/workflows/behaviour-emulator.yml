@@ -37,9 +37,9 @@ env:
   # fullsend reliability base d082258ed + run-job.sh BT_SUITE=agents.
   FULLSEND_REPO: waynesun09/fullsend
   FULLSEND_REF: ce55926346873cf23dc79502ff968f129836e908
-  # waynesun09/github-emulator ci-self-contained, as pinned by that fullsend ref.
+  # waynesun09/github-emulator ci-self-contained (with the GraphQL addComment and CreateIssueInput fixes).
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: 8205b205685b0f9e2dc8a86364abc2c85ab0e810
+  EMULATOR_REF: ce5e4c13f27ba6820739ac5913d6005e4e23ebab
 
 jobs:
   behaviour-emulator:
