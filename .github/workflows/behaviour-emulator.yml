@@ -27,8 +27,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The Makefile's default capabilities, as the live job runs them.
-  CAPABILITIES: applier-branch-namespace,review-skill-overrides
+  # The Makefile's default capabilities except review-skill-overrides: its
+  # custom-persona.feature fetches a harness base from
+  # raw.githubusercontent.com, which the emulator answers on a private VM
+  # address and fullsend's fetch guard refuses by design. Live only.
+  CAPABILITIES: applier-branch-namespace
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # fullsend with the emulator job (run-job.sh BT_SUITE=agents).
