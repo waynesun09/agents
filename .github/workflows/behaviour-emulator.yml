@@ -37,9 +37,9 @@ env:
   # fullsend reliability base d082258ed + run-job.sh BT_SUITE=agents.
   FULLSEND_REPO: waynesun09/fullsend
   FULLSEND_REF: ce55926346873cf23dc79502ff968f129836e908
-  # waynesun09/github-emulator ci-self-contained (with the GraphQL addComment and CreateIssueInput fixes).
+  # waynesun09/github-emulator ci-self-contained, reliability round 2.
   EMULATOR_REPO: waynesun09/github-emulator
-  EMULATOR_REF: ce5e4c13f27ba6820739ac5913d6005e4e23ebab
+  EMULATOR_REF: f016e9e690d33adbfe41131776f5097f65dec2d0
 
 jobs:
   behaviour-emulator:
@@ -113,4 +113,7 @@ jobs:
             ${{ runner.temp }}/bt-emulator/emulator-profile.json
             ${{ runner.temp }}/bt-emulator/bt-artifacts/
             !${{ runner.temp }}/bt-emulator/stack/runner-*/_work/**
+            # The OpenShell logs each agent run collects, to explain a
+            # sandbox that cannot reach the emulator.
+            ${{ runner.temp }}/bt-emulator/stack/runner-*/_work/*/*/output/*/logs/**
           if-no-files-found: warn
