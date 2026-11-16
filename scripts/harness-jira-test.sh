@@ -244,32 +244,48 @@ check_runner_mapping "${CODE_HARNESS}" code JIRA_USER_EMAIL '${FULLSEND_JIRA_EMA
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_DIR '${FULLSEND_DIR}'
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_CLIENT_ID '${FULLSEND_JIRA_CLIENT_ID}'
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_CLIENT_SECRET '${FULLSEND_JIRA_CLIENT_SECRET}'
-check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_OIDC_TOKEN_FD '${FULLSEND_JIRA_OIDC_TOKEN_FD}'
+# Newer fullsend posts the Jira code-stage comment itself, from the result
+# post-code writes to FULLSEND_JIRA_STAGE_RESULT.
+check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_STAGE_RESULT '${FULLSEND_JIRA_STAGE_RESULT}'
 
-# The broker fd is the only OIDC hand-off: no harness maps any other
-# FULLSEND_JIRA_OIDC_* name, or this one anywhere but env.runner of the
-# Jira overlay of code and triage. Every string in the file is listed with
-# its path, so a key or a value anywhere counts.
+# The broker fd reaches only the triage scripts: no harness maps any other
+# FULLSEND_JIRA_OIDC_* name, the code harness maps none (pre-code-jira and
+# post-code run gh, git and repo code), and triage maps the fd only in
+# env.runner of its Jira overlay. FULLSEND_JIRA_STAGE_RESULT is mapped only
+# there in the code harness. Every string in the file is listed with its
+# path, so a key or a value anywhere counts.
 for f in "${REPO_ROOT}"/harness/*.yaml; do
   name="$(basename "${f}" .yaml)"
-  got="$(yq -r '.. | select(tag == "!!str") | (path | join(".")) + "=" + .' "${f}" \
-    | grep -F "FULLSEND_JIRA_OIDC" || true)"
+  strings="$(yq -r '.. | select(tag == "!!str") | (path | join(".")) + "=" + .' "${f}")"
+  got="$(grep -F "FULLSEND_JIRA_OIDC" <<< "${strings}" || true)"
+  stage="$(grep -F "FULLSEND_JIRA_STAGE_RESULT" <<< "${strings}" || true)"
   ok=false
   case "${name}" in
-    code | triage)
-      if [[ "${got}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_OIDC_TOKEN_FD=\$\{FULLSEND_JIRA_OIDC_TOKEN_FD\}$ ]] \
+    triage)
+      if [[ -z "${stage}" && "${got}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_OIDC_TOKEN_FD=\$\{FULLSEND_JIRA_OIDC_TOKEN_FD\}$ ]] \
         && yq -r ".overlays[${BASH_REMATCH[1]}].when" "${f}" | grep -qF '"jira"'; then
         ok=true
       fi
       ;;
-    *) [[ -z "${got}" ]] && ok=true ;;
+    code)
+      if [[ -z "${got}" && "${stage}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_STAGE_RESULT=\$\{FULLSEND_JIRA_STAGE_RESULT\}$ ]] \
+        && yq -r ".overlays[${BASH_REMATCH[1]}].when" "${f}" | grep -qF '"jira"'; then
+        ok=true
+      fi
+      ;;
+    *) [[ -z "${got}${stage}" ]] && ok=true ;;
   esac
   if ${ok}; then
-    assert_pass "${name}-only-oidc-token-fd-mapping"
+    assert_pass "${name}-jira-oidc-and-stage-result-mappings"
   else
-    assert_fail "${name}-only-oidc-token-fd-mapping" "got: ${got//$'\n'/; }"
+    assert_fail "${name}-jira-oidc-and-stage-result-mappings" "got: ${got//$'\n'/; } ${stage//$'\n'/; }"
   fi
 done
+if ! yq -r '.. | select(tag == "!!str")' "${CODE_HARNESS}" | grep -qF FULLSEND_JIRA_OIDC_TOKEN_FD; then
+  assert_pass "code-harness-maps-no-broker-fd"
+else
+  assert_fail "code-harness-maps-no-broker-fd" "harness/code.yaml references FULLSEND_JIRA_OIDC_TOKEN_FD"
+fi
 
 # JIRA_USER_EMAIL reaches the sandbox through the expanded host file, not
 # env.sandbox (optional for a service account; #1900).

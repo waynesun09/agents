@@ -30,16 +30,18 @@
 #   REPO_DIR          — path to extracted repo (default: current directory)
 #
 # Jira-sourced runs (FULLSEND_TRACKER or FULLSEND_WORK_ITEM_SOURCE is "jira")
-# also need FULLSEND_WORK_ITEM_URL, JIRA_TOKEN, and FULLSEND_DIR (whose
-# config.yaml holds tracker.jira for the fullsend CLI) to write the
-# code-stage update and PR/MR URL to the Jira issue. JIRA_USER_EMAIL is
-# optional: when set, the write uses bot-user Basic auth; when unset or
-# empty, service-account Bearer auth. FULLSEND_JIRA_CLIENT_ID and
+# report the code stage and the PR/MR URL to the Jira issue. With
+# FULLSEND_JIRA_STAGE_RESULT (newer fullsend), the script writes one line of
+# JSON, {"verb":"opened|pushed","url":"<PR/MR URL>"}, to that file and
+# fullsend posts the comment after the script exits; the script then uses
+# no Jira credential, connection setting or CLI. Without it (older fullsend
+# releases), the script posts the comment itself through `fullsend issues`,
+# which needs FULLSEND_DIR (whose config.yaml holds tracker.jira) and
+# JIRA_TOKEN: JIRA_USER_EMAIL is optional (set: bot-user Basic auth; unset
+# or empty: service-account Bearer auth), and FULLSEND_JIRA_CLIENT_ID and
 # FULLSEND_JIRA_CLIENT_SECRET can replace JIRA_TOKEN (service-account OAuth
-# 2.0 client credentials), and FULLSEND_JIRA_OIDC_TOKEN_FD can replace both
-# (the fd of the CI OIDC token broker for a self-hosted Jira gateway,
-# tracker.jira.auth: oidc; see "Jira OIDC token broker" below); setting more
-# than one mode fails the Jira write. JIRA_BASE_URL is optional and
+# 2.0 client credentials). Setting both fails the run before any other
+# work. That fallback has no oidc mode. JIRA_BASE_URL is optional and
 # cross-checked against the work-item URL. GitLab targets take the GitLab
 # host from CI_SERVER_HOST.
 #
@@ -96,7 +98,8 @@ _jira_token_saved=""
 _jira_email_saved=""
 _jira_client_id_saved=""
 _jira_client_secret_saved=""
-_jira_oidc_fd_saved=""
+_jira_oidc_seen=""
+_jira_stage_result_saved=""
 # Keep credentials off the trace: xtrace off for the stash, restored after.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
@@ -104,20 +107,31 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
   unset _POST_CODE_JIRA_FD
   { IFS= read -r -d '' _jira_token_saved || true; IFS= read -r -d '' _jira_email_saved || true
     IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true
-    IFS= read -r -d '' _jira_oidc_fd_saved || true; } \
+    IFS= read -r -d '' _jira_oidc_seen || true; IFS= read -r -d '' _jira_stage_result_saved || true; } \
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
-elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}${FULLSEND_JIRA_STAGE_RESULT:-}" ]]; then
+  # post-code never uses a Jira token broker. Should a harness still pass
+  # one, close its fd here, before anything else runs, and keep only the
+  # fact that the run is in oidc mode, for the error message below.
+  if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+    _jira_oidc_seen=1
+    _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+    if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+      eval "exec $((10#${_jira_broker_fd}))<&-"
+    fi
+    unset _jira_broker_fd
+  fi
   _jira_stash_file="$(mktemp)"
   exec {_jira_stash_fd}<>"${_jira_stash_file}"
   rm -f "${_jira_stash_file}"
-  printf '%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
     "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" \
-    "${FULLSEND_JIRA_OIDC_TOKEN_FD-}" >&"${_jira_stash_fd}"
+    "${_jira_oidc_seen}" "${FULLSEND_JIRA_STAGE_RESULT-}" >&"${_jira_stash_fd}"
   exec env -u JIRA_TOKEN -u JIRA_USER_EMAIL -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL \
     -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
-    -u FULLSEND_JIRA_OIDC_TOKEN_FD \
+    -u FULLSEND_JIRA_OIDC_TOKEN_FD -u FULLSEND_JIRA_STAGE_RESULT \
     _POST_CODE_JIRA_FD="${_jira_stash_fd}" "${BASH}" "${BASH_SOURCE[0]}" "$@"
 fi
 (( _jira_xtrace_was_on )) && set -x
@@ -326,6 +340,10 @@ jira_auth_require_api_url() {
 # for a lowercase DNS name, and that host is not atlassian.com,
 # atlassian.net or a subdomain of either. Prints no URL.
 _jira_auth_check_gateway() {
+  # Byte-wise character classes: in some locales [a-z] also matches
+  # uppercase letters.
+  # shellcheck disable=SC2034
+  local LC_ALL=C
   local url="${JIRA_API_URL:-}"
   if [[ -z "${url}" ]]; then
     echo "ERROR: JIRA_API_URL (the Jira gateway URL from tracker.jira.api_url) must be set when FULLSEND_JIRA_OIDC_TOKEN_FD is used" >&2
@@ -351,11 +369,19 @@ _jira_auth_check_gateway() {
     fi
     host="${host%:*}"
   fi
-  if [[ ! "${host}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; then
+  if [[ "${host}" == *[[:upper:]]* \
+    || ! "${host}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; then
     echo "ERROR: JIRA_API_URL host must be a lowercase DNS name" >&2
     return 1
   fi
-  case "${host}" in
+  # The rule above already refuses these; compare lowercased and without
+  # trailing dots anyway, so the Atlassian refusal never rests on it alone.
+  local lower
+  lower="$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')"
+  while [[ "${lower}" == *. ]]; do
+    lower="${lower%.}"
+  done
+  case "${lower}" in
     atlassian.com | *.atlassian.com | atlassian.net | *.atlassian.net)
       echo "ERROR: JIRA_API_URL points at an Atlassian host; the OIDC token is sent only to a self-hosted Jira gateway" >&2
       return 1
@@ -381,6 +407,7 @@ _jira_auth_oidc_fd_open() {
 jira_auth_drop_oidc_fd() {
   local fd
   for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
+    fd="$(_jira_auth_trim "${fd}")"
     if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
       eval "exec $((10#${fd}))<&-"
     fi
@@ -404,8 +431,12 @@ _jira_auth_oidc_fetch() {
   fi
   IFS= read -r -t "${_JIRA_AUTH_OIDC_TIMEOUT}" line <&"${fd}" || rc=$?
   if (( rc > 128 )); then
+    # A late answer would be read as the reply to the next request, so the
+    # broker is not asked again: close the fd.
     line=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s" >&2
+    eval "exec ${fd}<&-"
+    _JIRA_AUTH_OIDC_FD=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s; closing it" >&2
     return 1
   fi
   if (( rc != 0 )); then
@@ -446,10 +477,8 @@ _jira_auth_oidc_fetch() {
 }
 
 # Run curl against the gateway with a broker token as Bearer. Called by
-# jira_auth_curl with xtrace off. Refuses, before asking the broker, a URL
-# argument outside JIRA_API_URL and curl options that would print the
-# request headers, read another config, write the headers elsewhere,
-# follow redirects or change the default scheme. The token is fetched for
+# jira_auth_curl with xtrace off. Refuses, before asking the broker, any
+# argument but the allowlisted options and URLs under JIRA_API_URL. The token is fetched for
 # this call only, into a local cleared after curl. curl runs without the
 # broker fd. The Authorization header goes in a curl config read from a
 # process substitution (printf is a builtin), so the token is in no argv;
@@ -458,35 +487,73 @@ _jira_auth_oidc_fetch() {
 # the answer; a second 401 fails with its own message. Each attempt's
 # output goes to a private file and only the last attempt's reaches the
 # caller, so a caller that parses curl's output sees one response. A body
-# read from stdin is refused, since a retry could not send it again.
+# from a file or stdin is refused, since a retry could not send it again.
 _jira_auth_oidc_curl() {
   _jira_auth_check_gateway || return 1
   local api="${JIRA_API_URL}"
   while [[ "${api}" == */ ]]; do
     api="${api%/}"
   done
-  local arg
+  # Only the options the Jira call sites use are allowed, each spelled out
+  # in full, with checked values. Everything else (other options, short
+  # forms, abbreviations, a body from a file or stdin, other URLs) is
+  # refused before the broker is asked.
+  local arg want="" lower
   for arg in "$@"; do
+    if [[ -n "${want}" ]]; then
+      case "${want}" in
+        --connect-timeout | --max-time)
+          [[ "${arg}" =~ ^[0-9]{1,4}$ ]] || want="bad"
+          ;;
+        --request)
+          [[ "${arg}" =~ ^[A-Z]{1,10}$ ]] || want="bad"
+          ;;
+        --write-out)
+          [[ "${arg}" == '\n%{http_code}' ]] || want="bad"
+          ;;
+        --header)
+          lower="$(printf '%s' "${arg}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${arg}" == @* || "${arg}" == *$'\n'* || "${arg}" == *$'\r'* \
+            || "${lower}" == authorization:* || "${lower}" == proxy-authorization:* ]]; then
+            want="bad"
+          fi
+          ;;
+        --data)
+          [[ "${arg}" != @* ]] || want="bad"
+          ;;
+      esac
+      if [[ "${want}" == "bad" ]]; then
+        echo "ERROR: a curl option value is not allowed with the OIDC token" >&2
+        return 1
+      fi
+      want=""
+      continue
+    fi
     case "${arg}" in
-      -v | --verbose | --trace | --trace-* | --stderr | -K | --config | -D | --dump-header \
-        | -L | --location | --location-* | --proto-default)
-        echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
+      --fail | --silent | --show-error) ;;
+      --connect-timeout | --max-time | --request | --write-out | --header | --data)
+        want="${arg}"
+        ;;
+      https://*)
+        if [[ "${arg}" != "${api}/"* ]]; then
+          echo "ERROR: refusing to send the OIDC token to a URL outside JIRA_API_URL" >&2
+          return 1
+        fi
+        ;;
+      -*)
+        echo "ERROR: curl option ${arg%%=*} is not allowed with the OIDC token" >&2
+        return 1
+        ;;
+      *)
+        echo "ERROR: a curl argument is not allowed with the OIDC token" >&2
         return 1
         ;;
     esac
-    if [[ "${arg}" =~ ^-[A-Za-z]+$ && "${arg}" == *[vKDL]* ]]; then
-      echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
-      return 1
-    fi
-    if [[ "${arg}" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// && "${arg}" != "${api}/"* ]]; then
-      echo "ERROR: refusing to send the OIDC token to a URL outside JIRA_API_URL" >&2
-      return 1
-    fi
-    if [[ "${arg}" == "@-" ]]; then
-      echo "ERROR: a request body from stdin is not allowed with the OIDC token" >&2
-      return 1
-    fi
   done
+  if [[ -n "${want}" ]]; then
+    echo "ERROR: curl option ${want} needs a value" >&2
+    return 1
+  fi
   local tok="" request="token" attempt rc hdr out code
   for attempt in 1 2; do
     _jira_auth_oidc_fetch "${request}" || {
@@ -716,95 +783,6 @@ jira_auth_fullsend() {
   fi
 }
 # END bundled: lib/jira-auth.lib.sh
-
-# ---------------------------------------------------------------------------
-# Jira OIDC token broker (tracker.jira.auth: oidc)
-#
-# With FULLSEND_JIRA_OIDC_TOKEN_FD, fullsend run gives this script one end
-# of a socket that hands out CI OIDC tokens. Repo-controlled code (git and
-# its hooks, pre-commit and its installs, gitleaks, gh) must never hold
-# that fd. The Jira write is this script's last step on every path, so this
-# process becomes a holder: it runs the script again as a worker child with
-# the fd closed and the variable unset, so nothing the worker starts can
-# reach the broker, waits for it, and then makes the one Jira write the
-# worker asked for. The worker passes only the update phrase and the PR/MR
-# URL, through a private file. The holder rebuilds the comment from its own
-# environment and accepts only a PR/MR URL of REPO_FULL_NAME, so a hook
-# that rewrites the file can at most change which PR/MR of this repository
-# the comment names.
-# ---------------------------------------------------------------------------
-_post_code_jira_holder() {
-  local fd="${_jira_oidc_fd_saved}"
-  if [[ ! "${fd}" =~ ^[0-9]{1,4}$ ]] || (( 10#${fd} < 3 )); then
-    echo "::error::FULLSEND_JIRA_OIDC_TOKEN_FD must be a file descriptor number from 3 up"
-    exit 1
-  fi
-  fd="$((10#${fd}))"
-  # Resolve the trusted tracker CLI before the worker can install anything.
-  local bin defer rc=0
-  bin="$(command -v fullsend 2>/dev/null || true)"
-  defer="$(mktemp)" || exit 1
-  (
-    eval "exec ${fd}<&-"
-    exec env -u FULLSEND_JIRA_OIDC_TOKEN_FD _POST_CODE_JIRA_DEFER="${defer}" \
-      "${BASH}" "${BASH_SOURCE[0]}" "$@"
-  ) || rc=$?
-  local verb="" url=""
-  { IFS= read -r -d '' verb || true; IFS= read -r -d '' url || true; } < "${defer}"
-  rm -f "${defer}"
-  if [[ "${rc}" -ne 0 ]]; then
-    exit "${rc}"
-  fi
-  # No request: the worker made no PR/MR to report (or this is not a Jira
-  # run).
-  [[ -n "${verb}${url}" ]] || exit 0
-
-  local key="${FULLSEND_WORK_ITEM_KEY:-}"
-  _post_code_jira_holder_fail() {
-    echo "::error::$1"
-    echo "::error::Failed to write the code-stage update to Jira issue ${key}"
-    exit 1
-  }
-  case "${verb}" in
-    "opened" | "pushed new commits to") ;;
-    *) _post_code_jira_holder_fail "Unexpected code-stage update from the worker" ;;
-  esac
-  if [[ ! "${url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/(.+)/(pull|-/merge_requests)/[0-9]+$ ]] \
-    || [[ "${BASH_REMATCH[2]}" != "${REPO_FULL_NAME:-}" ]]; then
-    _post_code_jira_holder_fail "The PR/MR URL from the worker is not a PR/MR of REPO_FULL_NAME"
-  fi
-  if [[ ! "${FULLSEND_WORK_ITEM_URL:-}" =~ ^https://([a-zA-Z0-9.-]+\.atlassian\.net)/browse/([A-Z][A-Z0-9]*)-([0-9]+)$ ]]; then
-    _post_code_jira_holder_fail "FULLSEND_WORK_ITEM_URL is not a Jira Cloud issue URL"
-  fi
-  local project="${BASH_REMATCH[2]}" number="${BASH_REMATCH[3]}"
-  if [[ "${project}-${number}" != "${key}" ]]; then
-    _post_code_jira_holder_fail "FULLSEND_WORK_ITEM_KEY does not match the Jira issue in FULLSEND_WORK_ITEM_URL"
-  fi
-  if ! jira_auth_select "${_jira_token_saved:-}" \
-    _jira_client_id_saved _jira_client_secret_saved _jira_oidc_fd_saved; then
-    _post_code_jira_holder_fail "Conflicting Jira credentials; cannot write to Jira"
-  fi
-  [[ -n "${FULLSEND_DIR:-}" ]] || _post_code_jira_holder_fail "FULLSEND_DIR is required to write to Jira (the fullsend CLI reads tracker.jira from its config.yaml)"
-  [[ -n "${bin}" ]] || _post_code_jira_holder_fail "fullsend CLI not found; cannot write to Jira"
-  local noun="pull request"
-  if [[ "${FULLSEND_FORGE:-}" == "gitlab" ]]; then
-    noun="merge request"
-  fi
-  local body="**Code stage:** ${verb} ${noun} ${url} for ${key}.
-
-Review and merge happen on the ${noun}."
-  if ! printf '%s' "${body}" | jira_auth_fullsend "${bin}" "${_jira_token_saved:-}" "${_jira_email_saved:-}" \
-    issues post-comment --tracker jira --fullsend-dir "${FULLSEND_DIR}" \
-    --project "${project}" --number "${number}" \
-    --marker "<!-- fullsend:code-agent -->" --result -; then
-    echo "::error::Failed to write the code-stage update to Jira issue ${key}"
-    exit 1
-  fi
-  exit 0
-}
-if [[ -n "${_jira_oidc_fd_saved}" ]]; then
-  _post_code_jira_holder "$@"
-fi
 
 # shellcheck source=lib/git-graph-policy.lib.sh
 # BEGIN bundled: lib/git-graph-policy.lib.sh
@@ -3904,6 +3882,15 @@ forge_ensure_label() {
 }
 # END bundled: lib/labels.lib.sh
 
+# Conflicting Jira credentials fail before any other work. Only the
+# fallback stage update (no FULLSEND_JIRA_STAGE_RESULT) uses them.
+if [[ -z "${_jira_stage_result_saved}" ]] \
+  && [[ "${FULLSEND_TRACKER:-${FULLSEND_WORK_ITEM_SOURCE:-}}" == "jira" ]] \
+  && ! jira_auth_select "${_jira_token_saved:-}" _jira_client_id_saved _jira_client_secret_saved; then
+  gha_echo error "Conflicting Jira credentials; cannot write to Jira"
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # enable_auto_merge — arm auto-merge on a PR/MR (best-effort).
 #
@@ -4320,25 +4307,42 @@ post_jira_stage_update() {
     gha_echo error "JIRA_BASE_URL does not match the Jira host in FULLSEND_WORK_ITEM_URL"
     return 1
   fi
-  # The credentials were withheld from the environment at the start of the
-  # script (see "Jira credential isolation"); they are passed to the trusted
-  # CLI below and nowhere else. The email is optional: without it the CLI
-  # uses service-account Bearer auth. Client credentials replace the token,
-  # and the CLI mints its own access token from them.
-  # With a token broker this process is the worker (see "Jira OIDC token
-  # broker"): it has no Jira credential and no broker fd, so it hands the
-  # update to the holder, which makes the write after this process exits.
-  if [ -n "${_POST_CODE_JIRA_DEFER:-}" ]; then
-    printf '%s\0%s\0' "${verb}" "${pr_url}" > "${_POST_CODE_JIRA_DEFER}"
+  # Newer fullsend posts the comment itself after this script exits: hand
+  # it the verb and the PR/MR URL, and use no Jira credential, connection
+  # setting or CLI here.
+  if [ -n "${_jira_stage_result_saved}" ]; then
+    local result_verb="pushed"
+    if [ "${verb}" = "opened" ]; then
+      result_verb="opened"
+    fi
+    if ! jq -cn --arg verb "${result_verb}" --arg url "${pr_url}" '{verb: $verb, url: $url}' \
+      > "${_jira_stage_result_saved}"; then
+      gha_echo error "Could not write the Jira stage result for fullsend"
+      return 1
+    fi
     return 0
   fi
+  # Older fullsend: post the comment here. The credentials were withheld
+  # from the environment at the start of the script (see "Jira credential
+  # isolation"); they are passed to the trusted CLI below and nowhere else.
+  # The email is optional: without it the CLI uses service-account Bearer
+  # auth. Client credentials replace the token, and the CLI mints its own
+  # access token from them.
   if ! jira_auth_select "${_jira_token_saved:-}" \
     _jira_client_id_saved _jira_client_secret_saved; then
     gha_echo error "Conflicting Jira credentials; cannot write to Jira"
     return 1
   fi
   if [ "${JIRA_AUTH_MODE}" = "none" ]; then
-    gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD)"
+    # oidc mode needs fullsend to post the comment (FULLSEND_JIRA_STAGE_RESULT).
+    # A broker fd seen at the start, or tracker.jira.auth: oidc in the
+    # config, picks the clearer message; the config is read for that only.
+    if [ -n "${_jira_oidc_seen}" ] || { [ -n "${FULLSEND_DIR:-}" ] \
+      && grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; }; then
+      gha_echo error "this fullsend release cannot post the Jira stage comment in oidc mode; upgrade fullsend so it sets FULLSEND_JIRA_STAGE_RESULT"
+    else
+      gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET)"
+    fi
     return 1
   fi
   if [ -z "${FULLSEND_DIR:-}" ]; then

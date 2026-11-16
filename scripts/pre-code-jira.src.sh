@@ -26,12 +26,6 @@
 #   FULLSEND_JIRA_CLIENT_ID, FULLSEND_JIRA_CLIENT_SECRET
 #                      — service-account OAuth 2.0 client credentials,
 #                         instead of JIRA_TOKEN (needs JIRA_API_URL)
-#   FULLSEND_JIRA_OIDC_TOKEN_FD
-#                      — fd of the CI OIDC token broker for a self-hosted
-#                         Jira gateway (tracker.jira.auth: oidc), instead
-#                         of both; the token goes only to JIRA_API_URL. The
-#                         fd is closed before gh, the GitLab API and the
-#                         pre-commit tool install run
 #   GH_TOKEN / GITLAB_TOKEN — target forge token for the existing-PR check;
 #                         the check is skipped when unset
 #   COMMENT_BODY       — trigger comment; when unset, read from the dispatch
@@ -40,6 +34,17 @@
 #   FULLSEND_APP_SET   — GitHub App identity prefix (default "fullsend-ai"),
 #                         used to exclude bot-authored PRs
 set -euo pipefail
+
+# This script uses no Jira token broker: gh, the GitLab API and the
+# pre-commit tool install run around its Jira calls. Should a harness pass
+# one, close its fd and unset the variable before anything else runs.
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/prescript-output.lib.sh
@@ -127,7 +132,7 @@ JIRA_CREDS_OK=0
 # Test the credentials with xtrace off so the secret is not traced.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 _jira_creds_set=0
-[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]] && _jira_creds_set=1
+[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]] && _jira_creds_set=1
 (( _jira_xtrace_was_on )) && set -x
 unset _jira_xtrace_was_on
 if (( _jira_creds_set )); then
@@ -174,11 +179,6 @@ _jira_list_human_prs() {
   local bot="${2%\[bot\]}"
   local coder="${3%\[bot\]}"
   local prs=""
-  # Called in a command substitution only: drop the Jira token broker fd in
-  # that subshell, so gh and the GitLab API calls never hold it.
-  if declare -F jira_auth_drop_oidc_fd > /dev/null; then
-    jira_auth_drop_oidc_fd
-  fi
   case "${FULLSEND_FORGE}" in
     github)
       prs="$(gh pr list --repo "${REPO_FULL_NAME}" --state open --limit 500 \
@@ -327,12 +327,6 @@ The code agent implements leaf work items. Use the child issues for implementati
       echo "No child issues found"
     fi
   fi
-fi
-
-# The Jira calls are done. Close the token broker fd before git, the
-# pre-commit tool resolver and installer run code from the target repo.
-if declare -F jira_auth_drop_oidc_fd > /dev/null; then
-  jira_auth_drop_oidc_fd
 fi
 
 # ---------------------------------------------------------------------------

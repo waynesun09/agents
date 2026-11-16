@@ -3718,7 +3718,13 @@ for arg in "\$@"; do
   prev="\${arg}"
 done
 case "\${method} \${url}" in
-  *merge_requests\?state=opened*) echo '[]' ;;
+  *merge_requests\?state=opened*)
+    if [[ -n "\${MOCK_EXISTING_PR:-}" ]]; then
+      echo '[{"iid":5,"source_project_id":1,"web_url":"https://gitlab.com/test-group/test-project/-/merge_requests/5"}]'
+    else
+      echo '[]'
+    fi ;;
+  GET*merge_requests/5) echo '{"iid":5,"web_url":"https://gitlab.com/test-group/test-project/-/merge_requests/5"}' ;;
   POST*merge_requests) echo '{"iid":1,"web_url":"https://gitlab.com/test-group/test-project/-/merge_requests/1"}' ;;
   *projects/*) echo '{"id":1,"default_branch":"main","merge_method":"merge"}' ;;
   *users*) echo '[]' ;;
@@ -4144,103 +4150,97 @@ for _jira_conflict_case in "both|JIRA_TOKEN=fake-jira-token" "id-only|FULLSEND_J
   fi
 done
 
-# CI OIDC token broker (tracker.jira.auth: oidc). post-code runs its work as
-# a child without the broker fd and makes the Jira write itself afterwards.
-# The CLI gets the fd and FULLSEND_JIRA_OIDC_TOKEN_FD, and can ask the
-# broker for a token. No other child (pre-commit, the pre-push and
-# reference-transaction hooks, gh, gitleaks) has the variable or the
-# broker's socket among its open fds. Needs /proc (Linux).
-JIRA_OIDC_ENV=(JIRA_TOKEN= FULLSEND_JIRA_TOKEN= JIRA_USER_EMAIL= FULLSEND_JIRA_EMAIL=
-  "JIRA_API_URL=https://jira-gw.example.com/ex/jira/cloud-1")
-JIRA_OIDC_TOKEN_VALUE="test-header.test-payload.post-code-oidc-DO-NOT-LEAK"
+# Jira stage result (FULLSEND_JIRA_STAGE_RESULT, newer fullsend): post-code
+# writes one line of JSON for fullsend to post, and makes no Jira call of
+# its own: no `fullsend issues`, no Jira URL, whatever credentials are set.
+# A broker fd from a harness that still passes one is closed at the start,
+# so no child holds it (checked through /proc; Linux only).
 
-# jira_int_children_without_broker NAME... — every child named in the fd
-# log except fullsend ran without the variable and without the broker's
-# socket, and each NAME ran at least once.
-jira_int_children_without_broker() {
-  local inode name
-  inode="$(sed -n 's/^inode //p' "${JIRA_INT_BROKER_LOG}")"
-  [ -n "${inode}" ] || return 1
-  if grep -v '^fullsend ' "${JIRA_INT_FD_LOG}" | grep -qvF ' var=unset fds='; then
-    return 1
-  fi
-  if grep -v '^fullsend ' "${JIRA_INT_FD_LOG}" | grep -qF -- "${inode}"; then
-    return 1
-  fi
-  for name in "$@"; do
-    grep -q "^${name} " "${JIRA_INT_FD_LOG}" || return 1
-  done
+# run_jira_result NAME FORGE [NAME=VALUE...] — run_jira_int with an empty
+# 0600 result file; leaves its path in JIRA_RESULT_FILE.
+run_jira_result() {
+  local name="$1" forge="$2"
+  shift 2
+  JIRA_RESULT_FILE="${JIRA_INT_TMPDIR}/stage-result-${name}"
+  (umask 077 && : > "${JIRA_RESULT_FILE}")
+  run_jira_int "${name}" "${forge}" "FULLSEND_JIRA_STAGE_RESULT=${JIRA_RESULT_FILE}" "$@"
 }
 
+# jira_result_no_jira_call — no CLI call and no curl request to a Jira REST
+# endpoint (the PR/MR body links the Jira issue, so gh lines name its URL).
+jira_result_no_jira_call() {
+  [ ! -s "${JIRA_INT_FULLSEND_LOG}" ] \
+    && ! grep -qE '^curl .*(atlassian\.(net|com)/rest|/ex/jira/)' "${JIRA_INT_FORGE_LOG}"
+}
+
+for _jr_case in \
+  "github|opened||https://github.com/test-org/test-repo/pull/1" \
+  "github|pushed|1|https://github.com/test-org/test-repo/pull/7" \
+  "gitlab|opened||https://gitlab.com/test-group/test-project/-/merge_requests/1" \
+  "gitlab|pushed|1|https://gitlab.com/test-group/test-project/-/merge_requests/5"; do
+  IFS='|' read -r _jr_forge _jr_verb _jr_existing _jr_url <<< "${_jr_case}"
+  _jr_name="jira-stage-result-${_jr_forge}-${_jr_verb}"
+  MOCK_EXISTING_PR="${_jr_existing}" run_jira_result "${_jr_name}" "${_jr_forge}"
+  _jr_want="{\"verb\":\"${_jr_verb}\",\"url\":\"${_jr_url}\"}"
+  if [ "${JIRA_INT_RC}" -ne 0 ]; then
+    jira_int_fail "${_jr_name}" "post-code failed"
+  elif [ "$(cat "${JIRA_RESULT_FILE}")" != "${_jr_want}" ] || [ "$(wc -l < "${JIRA_RESULT_FILE}")" -ne 1 ]; then
+    jira_int_fail "${_jr_name}" "result is '$(cat "${JIRA_RESULT_FILE}")', want '${_jr_want}'"
+  elif ! jira_result_no_jira_call; then
+    jira_int_fail "${_jr_name}" "post-code called the fullsend CLI or a Jira URL"
+  else
+    echo "PASS: ${_jr_name}"
+  fi
+done
+
+# A harness that still passes a broker fd: the result is written, and no
+# child (pre-commit, the hooks, gh, gitleaks) holds the fd or the variable.
 if [ ! -d /proc/self/fd ]; then
-  echo "SKIP: jira-oidc-* (needs /proc)"
+  echo "SKIP: jira-stage-result-no-broker-fd-in-children (needs /proc)"
 else
   : > "${JIRA_INT_PRECOMMIT_LOG}"
   : > "${JIRA_INT_PREPUSH_LOG}"
-  JIRA_INT_REFTX_LOG="${JIRA_INT_TMPDIR}/reftx-oidc.log"
-  : > "${JIRA_INT_REFTX_LOG}"
-  JIRA_INT_BROKER="ok ${JIRA_OIDC_TOKEN_VALUE}" JIRA_INT_WITH_PRECOMMIT=1 \
-    JIRA_INT_PREPUSH_HOOK="${JIRA_INT_PREPUSH_LOG}" JIRA_INT_REFTX_HOOK="${JIRA_INT_REFTX_LOG}" \
-    run_jira_int "jira-oidc" github "${JIRA_OIDC_ENV[@]}"
-  if [ "${JIRA_INT_RC}" -ne 0 ]; then
-    jira_int_fail "jira-oidc-stage-update" "post-code failed"
-  elif ! grep -qF "env-token=unset env-email=unset env-client-id=unset env-client-secret= broker-var-present=set broker=answered-ok " "${JIRA_INT_FULLSEND_LOG}" \
-       || ! grep -qF -- "${JIRA_CODE_MARKER}" "${JIRA_INT_FULLSEND_LOG}" \
-       || ! grep -qF "**Code stage:** opened pull request https://github.com/test-org/test-repo/pull/1 for TESTPROJ-42." "${JIRA_INT_FULLSEND_LOG}"; then
-    jira_int_fail "jira-oidc-stage-update" "the CLI did not get the broker fd alone, or the comment is wrong"
-  elif ! jira_int_children_without_broker pre-commit pre-push gh gitleaks; then
+  JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" JIRA_INT_WITH_PRECOMMIT=1 \
+    JIRA_INT_PREPUSH_HOOK="${JIRA_INT_PREPUSH_LOG}" \
+    run_jira_result "jira-stage-result-broker" github JIRA_TOKEN= FULLSEND_JIRA_TOKEN=
+  _jr_inode="$(sed -n 's/^inode //p' "${JIRA_INT_BROKER_LOG}")"
+  if [ "${JIRA_INT_RC}" -ne 0 ] || [ ! -s "${JIRA_RESULT_FILE}" ]; then
+    jira_int_fail "jira-stage-result-no-broker-fd-in-children" "post-code failed or wrote no result"
+  elif [ -z "${_jr_inode}" ] || grep -qF -- "${_jr_inode}" "${JIRA_INT_FD_LOG}" \
+       || grep -qvF ' var=unset fds=' "${JIRA_INT_FD_LOG}" \
+       || ! grep -q '^pre-commit ' "${JIRA_INT_FD_LOG}" || ! grep -q '^pre-push ' "${JIRA_INT_FD_LOG}" \
+       || ! grep -q '^gh ' "${JIRA_INT_FD_LOG}" || ! grep -q '^gitleaks ' "${JIRA_INT_FD_LOG}" \
+       || grep -q '^request ' "${JIRA_INT_BROKER_LOG}"; then
     cat "${JIRA_INT_FD_LOG}"
-    jira_int_fail "jira-oidc-stage-update" "a hook, pre-commit, gh or gitleaks held the broker fd or its variable"
-  elif grep -qF "${JIRA_OIDC_TOKEN_VALUE}" "${JIRA_INT_OUT}" "${JIRA_INT_FULLSEND_LOG}" "${JIRA_INT_FORGE_LOG}"; then
-    jira_int_fail "jira-oidc-stage-update" "OIDC token in output or on a command line"
+    jira_int_fail "jira-stage-result-no-broker-fd-in-children" "a child held the broker fd or its variable, or the broker was asked"
   else
-    echo "PASS: jira-oidc-stage-update"
-  fi
-
-  # The existing-PR path defers its update to the holder the same way.
-  MOCK_EXISTING_PR=1 JIRA_INT_BROKER="ok ${JIRA_OIDC_TOKEN_VALUE}" \
-    run_jira_int "jira-oidc-existing-pr" github "${JIRA_OIDC_ENV[@]}"
-  if [ "${JIRA_INT_RC}" -ne 0 ] \
-     || ! grep -qF "broker=answered-ok" "${JIRA_INT_FULLSEND_LOG}" \
-     || ! grep -qF "**Code stage:** pushed new commits to pull request https://github.com/test-org/test-repo/pull/7" "${JIRA_INT_FULLSEND_LOG}" \
-     || ! jira_int_children_without_broker gh; then
-    jira_int_fail "jira-oidc-existing-pr-stage-update" "the existing-PR update did not go through the holder"
-  else
-    echo "PASS: jira-oidc-existing-pr-stage-update"
-  fi
-
-  # The broker fd next to a token fails the Jira write without the CLI.
-  JIRA_INT_BROKER="ok ${JIRA_OIDC_TOKEN_VALUE}" \
-    run_jira_int "jira-oidc-conflict" github "${JIRA_OIDC_ENV[@]}" JIRA_TOKEN=fake-jira-token
-  if [ "${JIRA_INT_RC}" -eq 0 ]; then
-    jira_int_fail "jira-oidc-conflict-fails-step" "expected failure but got success"
-  elif ! grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FD" "${JIRA_INT_OUT}" || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
-    jira_int_fail "jira-oidc-conflict-fails-step" "missing error naming the variables, or a write was attempted"
-  else
-    echo "PASS: jira-oidc-conflict-fails-step (expected failure, got exit ${JIRA_INT_RC})"
-  fi
-
-  # The holder checks JIRA_API_URL before starting the CLI with the fd.
-  JIRA_INT_BROKER="ok ${JIRA_OIDC_TOKEN_VALUE}" \
-    run_jira_int "jira-oidc-atlassian-api-url" github "${JIRA_OIDC_ENV[@]}" \
-    "JIRA_API_URL=https://api.atlassian.com/ex/jira/cloud-1"
-  if [ "${JIRA_INT_RC}" -eq 0 ]; then
-    jira_int_fail "jira-oidc-atlassian-api-url-fails-step" "expected failure but got success"
-  elif ! grep -qF "Atlassian host" "${JIRA_INT_OUT}" || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
-    jira_int_fail "jira-oidc-atlassian-api-url-fails-step" "missing gateway error, or a write was attempted"
-  else
-    echo "PASS: jira-oidc-atlassian-api-url-fails-step (expected failure, got exit ${JIRA_INT_RC})"
-  fi
-
-  # A worker failure is passed through and nothing is written to Jira.
-  JIRA_INT_BROKER="ok ${JIRA_OIDC_TOKEN_VALUE}" \
-    run_jira_int "jira-oidc-worker-fails" github "${JIRA_OIDC_ENV[@]}" FULLSEND_WORK_ITEM_KEY=TEST-999
-  if [ "${JIRA_INT_RC}" -eq 0 ] || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
-    jira_int_fail "jira-oidc-worker-failure-not-written" "expected failure with no Jira write"
-  else
-    echo "PASS: jira-oidc-worker-failure-not-written (expected failure, got exit ${JIRA_INT_RC})"
+    echo "PASS: jira-stage-result-no-broker-fd-in-children"
   fi
 fi
+
+# oidc mode on an older fullsend (no result variable) cannot post the
+# comment: post-code fails with a clear message and calls no CLI. The mode
+# is recognised from a broker fd, or from tracker.jira.auth: oidc.
+JIRA_OIDC_CONFIG_DIR="${JIRA_INT_TMPDIR}/dot-fullsend-oidc"
+mkdir -p "${JIRA_OIDC_CONFIG_DIR}"
+printf 'tracker:\n  jira:\n    base_url: https://test.atlassian.net\n    auth: oidc\n' > "${JIRA_OIDC_CONFIG_DIR}/config.yaml"
+for _jo_case in "broker-fd" "config"; do
+  if [ "${_jo_case}" = "broker-fd" ]; then
+    JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" \
+      run_jira_int "jira-oidc-no-result-${_jo_case}" github JIRA_TOKEN= FULLSEND_JIRA_TOKEN=
+  else
+    run_jira_int "jira-oidc-no-result-${_jo_case}" github JIRA_TOKEN= FULLSEND_JIRA_TOKEN= \
+      "FULLSEND_DIR=${JIRA_OIDC_CONFIG_DIR}"
+  fi
+  if [ "${JIRA_INT_RC}" -eq 0 ]; then
+    jira_int_fail "jira-oidc-no-result-${_jo_case}-fails" "expected failure but got success"
+  elif ! grep -qF "this fullsend release cannot post the Jira stage comment in oidc mode" "${JIRA_INT_OUT}" \
+       || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
+    jira_int_fail "jira-oidc-no-result-${_jo_case}-fails" "missing oidc message, or a write was attempted"
+  else
+    echo "PASS: jira-oidc-no-result-${_jo_case}-fails (expected failure, got exit ${JIRA_INT_RC})"
+  fi
+done
 
 # The config-backed CLI needs FULLSEND_DIR for tracker.jira.
 run_jira_int "jira-missing-fullsend-dir" github FULLSEND_DIR=

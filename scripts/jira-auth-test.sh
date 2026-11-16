@@ -753,7 +753,9 @@ for api in "unset" "https://api.atlassian.com/ex/jira/cloud-1" "https://site.atl
   "https://jira.atlassian.com:443/x" "http://jira-gw.example.com/ex/jira/cloud-1" \
   "https://api.atlassian%2Ecom/ex/jira/cloud-1" "https://atlass%69an.net/" \
   "https://jira-gw.example.com\\@api.atlassian.com/x" "https://jira-gw.example.com:/x" \
-  "https://jira-gw.example.com:44a/x" "https://-gw.example.com/x"; do
+  "https://jira-gw.example.com:44a/x" "https://-gw.example.com/x" \
+  "https://API.Atlassian.COM/ex/jira/c" "https://api.atlassian.com./ex/jira/c" \
+  "https://Jira-GW.example.com/ex/jira/c" "https://jira-gw.example.com./ex/jira/c"; do
   api_setup="export JIRA_API_URL='${api}'"
   [[ "${api}" == "unset" ]] && api_setup="export JIRA_BASE_URL=https://site.atlassian.net"
   CASE_BROKER="ok ${OIDC_TOKEN}" run_case "oidc-api-url" "
@@ -787,25 +789,81 @@ else
   fail "oidc-cli-checks-gateway-first" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
 fi
 
-# A URL argument outside JIRA_API_URL, and curl options that would print
-# or redirect the headers, read another config, follow redirects or change
-# the default scheme, are refused before the broker is asked.
-for bad in "https://site.atlassian.net/rest/api/3/myself" -v --verbose --trace --trace-ascii \
-  --trace-config --stderr -K --config -D --dump-header -L --location --location-trusted \
-  --proto-default -sv -sSL @-; do
+# Only the call sites' options are allowed, spelled out in full and with
+# checked values. Other options (also attached, =value and abbreviated
+# forms), bodies from a file or stdin, Authorization headers, other
+# write-out formats and URLs outside JIRA_API_URL are refused before the
+# broker is asked. Arguments are separated by "|".
+for bad in "https://site.atlassian.net/rest/api/3/myself" "-v" "--verbose" "--trace|x" \
+  "--trace-ascii|x" "--stderr|x" "-K|x" "-K/tmp/x" "--config|x" "--config=x" "-D|x" \
+  "--dump-header|x" "-L" "--location" "--location-trusted" "--proto-default|https" \
+  "-sv" "-sSL" "--libcurl|x" "-svo/dev/null" "--connect-to|a:1:b:2" "--resolve|a:1:127.0.0.1" \
+  "-k" "--insecure" "-x|http://p" "--verb" "--max-time=5" "--fai" "-d@-" "--data|@-" \
+  "--data|@/etc/passwd" "--data-binary|@-" "--json|@-" "-T|-" "--header|Authorization: Bearer x" \
+  "--header|authorization:x" "--header|@hdr" "--write-out|%{stderr}" "--request|post me" \
+  "--max-time|5s" "stray"; do
   CASE_BROKER="ok ${OIDC_TOKEN}" run_case "oidc-bad-arg" "
     export JIRA_API_URL=\"\${TEST_GATEWAY}\"
     jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
-    jira_auth_curl '' '' --silent '${bad}' \"\${TEST_GATEWAY}/rest/api/3/myself\"
+    IFS='|' read -r -a extra <<< '${bad}'
+    jira_auth_curl '' '' --silent \"\${extra[@]}\" \"\${TEST_GATEWAY}/rest/api/3/myself\"
   "
-  if [[ "${CASE_RC}" -ne 0 ]] && grep -qE "outside JIRA_API_URL|is not allowed with the OIDC token" "${CASE_ERR}" \
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qE "outside JIRA_API_URL|not allowed with the OIDC token|needs a value" "${CASE_ERR}" \
     && [[ ! -f "${CASE_DIR}/curl-argv.log" && "$(broker_requests)" -eq 0 ]]; then
-    pass "oidc-refuses-curl-arg-'${bad}'"
+    pass "oidc-refuses-curl-args-'${bad}'"
   else
-    fail "oidc-refuses-curl-arg-'${bad}'" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+    fail "oidc-refuses-curl-args-'${bad}'" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
   fi
   rm -rf "${CASE_DIR}"
 done
+
+# Every option the call sites use is accepted.
+CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-allowed-args '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+    --header "Content-Type: application/json" --header "Accept: application/json" \
+    --request POST --write-out "\n%{http_code}" --data "{\"a\":1}" \
+    "${JIRA_API_URL}/rest/api/3/search/jql" >/dev/null
+'
+if [[ "${CASE_RC}" -eq 0 ]] && [[ "$(broker_requests)" -eq 1 ]]; then
+  pass "oidc-allows-call-site-options"
+else
+  fail "oidc-allows-call-site-options" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+
+# A broker that does not answer in time is closed: the next call fails as
+# "not open" without writing to it again.
+CASE_BROKER="hang
+ok ${OIDC_TOKEN}" run_case oidc-timeout-closes '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  _JIRA_AUTH_OIDC_TIMEOUT=1
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" || echo first=refused
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" || echo second=refused
+  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo fd=open || echo fd=closed"
+'
+if grep -qx "first=refused" "${CASE_OUT}" && grep -qx "second=refused" "${CASE_OUT}" \
+  && grep -qx "fd=closed" "${CASE_OUT}" && grep -qF "closing it" "${CASE_ERR}" \
+  && grep -qF "token broker is not open" "${CASE_ERR}" && [[ "$(broker_requests)" -eq 1 ]] \
+  && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+  pass "oidc-timeout-closes-broker-fd"
+else
+  fail "oidc-timeout-closes-broker-fd" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
+
+# A broker fd value with surrounding whitespace is trimmed, as by
+# jira_auth_select, so jira_auth_drop_oidc_fd still closes it.
+CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-drop-trimmed '
+  export FULLSEND_JIRA_OIDC_TOKEN_FD=" ${FULLSEND_JIRA_OIDC_TOKEN_FD} "
+  jira_auth_drop_oidc_fd
+  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo fd=open || echo fd=closed; echo var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}"
+'
+if grep -qx "fd=closed" "${CASE_OUT}" && grep -qx "var=unset" "${CASE_OUT}"; then
+  pass "oidc-drop-trims-fd-value"
+else
+  fail "oidc-drop-trims-fd-value" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
 
 # A 401 makes the call ask the broker to refresh and try once more with
 # the new token. When that succeeds, the caller sees only the second
@@ -864,7 +922,7 @@ else
 fi
 
 # Real curl against a local HTTPS listener with a self-signed certificate
-# (--cacert): the Bearer header arrives, a 401 fails with its message, and
+# (trusted through CURL_CA_BUNDLE): the Bearer header arrives, a 401 fails with its message, and
 # a 404 under --fail keeps curl's exit code 22. Skipped when openssl or the
 # listener is unavailable.
 REAL_DIR="${TMPDIR_ROOT}/real-curl"
@@ -896,13 +954,13 @@ else
     > "${REAL_DIR}/answers"
   REAL_RC=0
   env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET -u JIRA_TOKEN \
-    JIRA_API_URL="${REAL_GW}" CACERT="${REAL_DIR}/cert.pem" \
+    JIRA_API_URL="${REAL_GW}" CURL_CA_BUNDLE="${REAL_DIR}/cert.pem" \
     python3 -I "${BROKER}" "${REAL_DIR}/broker.log" "${REAL_DIR}/answers" -- \
     bash -c "set -uo pipefail; source '${LIB}'
       jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
-      body=\"\$(jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/myself\")\"; echo \"ok-rc=\$? body=\${body}\"
-      jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/denied\" >/dev/null; echo \"denied-rc=\$?\"
-      jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/missing\" >/dev/null; echo \"missing-rc=\$?\"
+      body=\"\$(jira_auth_curl '' '' --fail --silent --show-error \"\${JIRA_API_URL}/rest/api/3/myself\")\"; echo \"ok-rc=\$? body=\${body}\"
+      jira_auth_curl '' '' --fail --silent --show-error \"\${JIRA_API_URL}/rest/api/3/denied\" >/dev/null; echo \"denied-rc=\$?\"
+      jira_auth_curl '' '' --fail --silent --show-error \"\${JIRA_API_URL}/rest/api/3/missing\" >/dev/null; echo \"missing-rc=\$?\"
     " > "${REAL_DIR}/out" 2> "${REAL_DIR}/err" || REAL_RC=$?
   kill "${REAL_PID}" 2>/dev/null || true
   wait "${REAL_PID}" 2>/dev/null || true

@@ -28,6 +28,17 @@
 
 set -euo pipefail
 
+# This script uses no Jira token broker: gh runs between its Jira calls.
+# Should a harness pass one, close its fd and unset the variable before
+# anything else runs.
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
+fi
+
 : "${FULLSEND_FORGE:?FULLSEND_FORGE must be set}"
 
 # shellcheck disable=SC2034 # SCRIPT_DIR used by source in .src.sh; unused in bundled .sh
@@ -981,6 +992,10 @@ jira_auth_require_api_url() {
 # for a lowercase DNS name, and that host is not atlassian.com,
 # atlassian.net or a subdomain of either. Prints no URL.
 _jira_auth_check_gateway() {
+  # Byte-wise character classes: in some locales [a-z] also matches
+  # uppercase letters.
+  # shellcheck disable=SC2034
+  local LC_ALL=C
   local url="${JIRA_API_URL:-}"
   if [[ -z "${url}" ]]; then
     echo "ERROR: JIRA_API_URL (the Jira gateway URL from tracker.jira.api_url) must be set when FULLSEND_JIRA_OIDC_TOKEN_FD is used" >&2
@@ -1006,11 +1021,19 @@ _jira_auth_check_gateway() {
     fi
     host="${host%:*}"
   fi
-  if [[ ! "${host}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; then
+  if [[ "${host}" == *[[:upper:]]* \
+    || ! "${host}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; then
     echo "ERROR: JIRA_API_URL host must be a lowercase DNS name" >&2
     return 1
   fi
-  case "${host}" in
+  # The rule above already refuses these; compare lowercased and without
+  # trailing dots anyway, so the Atlassian refusal never rests on it alone.
+  local lower
+  lower="$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')"
+  while [[ "${lower}" == *. ]]; do
+    lower="${lower%.}"
+  done
+  case "${lower}" in
     atlassian.com | *.atlassian.com | atlassian.net | *.atlassian.net)
       echo "ERROR: JIRA_API_URL points at an Atlassian host; the OIDC token is sent only to a self-hosted Jira gateway" >&2
       return 1
@@ -1036,6 +1059,7 @@ _jira_auth_oidc_fd_open() {
 jira_auth_drop_oidc_fd() {
   local fd
   for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
+    fd="$(_jira_auth_trim "${fd}")"
     if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
       eval "exec $((10#${fd}))<&-"
     fi
@@ -1059,8 +1083,12 @@ _jira_auth_oidc_fetch() {
   fi
   IFS= read -r -t "${_JIRA_AUTH_OIDC_TIMEOUT}" line <&"${fd}" || rc=$?
   if (( rc > 128 )); then
+    # A late answer would be read as the reply to the next request, so the
+    # broker is not asked again: close the fd.
     line=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s" >&2
+    eval "exec ${fd}<&-"
+    _JIRA_AUTH_OIDC_FD=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s; closing it" >&2
     return 1
   fi
   if (( rc != 0 )); then
@@ -1101,10 +1129,8 @@ _jira_auth_oidc_fetch() {
 }
 
 # Run curl against the gateway with a broker token as Bearer. Called by
-# jira_auth_curl with xtrace off. Refuses, before asking the broker, a URL
-# argument outside JIRA_API_URL and curl options that would print the
-# request headers, read another config, write the headers elsewhere,
-# follow redirects or change the default scheme. The token is fetched for
+# jira_auth_curl with xtrace off. Refuses, before asking the broker, any
+# argument but the allowlisted options and URLs under JIRA_API_URL. The token is fetched for
 # this call only, into a local cleared after curl. curl runs without the
 # broker fd. The Authorization header goes in a curl config read from a
 # process substitution (printf is a builtin), so the token is in no argv;
@@ -1113,35 +1139,73 @@ _jira_auth_oidc_fetch() {
 # the answer; a second 401 fails with its own message. Each attempt's
 # output goes to a private file and only the last attempt's reaches the
 # caller, so a caller that parses curl's output sees one response. A body
-# read from stdin is refused, since a retry could not send it again.
+# from a file or stdin is refused, since a retry could not send it again.
 _jira_auth_oidc_curl() {
   _jira_auth_check_gateway || return 1
   local api="${JIRA_API_URL}"
   while [[ "${api}" == */ ]]; do
     api="${api%/}"
   done
-  local arg
+  # Only the options the Jira call sites use are allowed, each spelled out
+  # in full, with checked values. Everything else (other options, short
+  # forms, abbreviations, a body from a file or stdin, other URLs) is
+  # refused before the broker is asked.
+  local arg want="" lower
   for arg in "$@"; do
+    if [[ -n "${want}" ]]; then
+      case "${want}" in
+        --connect-timeout | --max-time)
+          [[ "${arg}" =~ ^[0-9]{1,4}$ ]] || want="bad"
+          ;;
+        --request)
+          [[ "${arg}" =~ ^[A-Z]{1,10}$ ]] || want="bad"
+          ;;
+        --write-out)
+          [[ "${arg}" == '\n%{http_code}' ]] || want="bad"
+          ;;
+        --header)
+          lower="$(printf '%s' "${arg}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${arg}" == @* || "${arg}" == *$'\n'* || "${arg}" == *$'\r'* \
+            || "${lower}" == authorization:* || "${lower}" == proxy-authorization:* ]]; then
+            want="bad"
+          fi
+          ;;
+        --data)
+          [[ "${arg}" != @* ]] || want="bad"
+          ;;
+      esac
+      if [[ "${want}" == "bad" ]]; then
+        echo "ERROR: a curl option value is not allowed with the OIDC token" >&2
+        return 1
+      fi
+      want=""
+      continue
+    fi
     case "${arg}" in
-      -v | --verbose | --trace | --trace-* | --stderr | -K | --config | -D | --dump-header \
-        | -L | --location | --location-* | --proto-default)
-        echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
+      --fail | --silent | --show-error) ;;
+      --connect-timeout | --max-time | --request | --write-out | --header | --data)
+        want="${arg}"
+        ;;
+      https://*)
+        if [[ "${arg}" != "${api}/"* ]]; then
+          echo "ERROR: refusing to send the OIDC token to a URL outside JIRA_API_URL" >&2
+          return 1
+        fi
+        ;;
+      -*)
+        echo "ERROR: curl option ${arg%%=*} is not allowed with the OIDC token" >&2
+        return 1
+        ;;
+      *)
+        echo "ERROR: a curl argument is not allowed with the OIDC token" >&2
         return 1
         ;;
     esac
-    if [[ "${arg}" =~ ^-[A-Za-z]+$ && "${arg}" == *[vKDL]* ]]; then
-      echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
-      return 1
-    fi
-    if [[ "${arg}" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// && "${arg}" != "${api}/"* ]]; then
-      echo "ERROR: refusing to send the OIDC token to a URL outside JIRA_API_URL" >&2
-      return 1
-    fi
-    if [[ "${arg}" == "@-" ]]; then
-      echo "ERROR: a request body from stdin is not allowed with the OIDC token" >&2
-      return 1
-    fi
   done
+  if [[ -n "${want}" ]]; then
+    echo "ERROR: curl option ${want} needs a value" >&2
+    return 1
+  fi
   local tok="" request="token" attempt rc hdr out code
   for attempt in 1 2; do
     _jira_auth_oidc_fetch "${request}" || {

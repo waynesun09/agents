@@ -209,15 +209,12 @@ overlays:
         # scripts/lib/jira-auth.lib.sh refuses them next to a token.
         FULLSEND_JIRA_CLIENT_ID: "${FULLSEND_JIRA_CLIENT_ID}"
         FULLSEND_JIRA_CLIENT_SECRET: "${FULLSEND_JIRA_CLIENT_SECRET}"
-        # fd number of the CI OIDC token broker for a self-hosted Jira
-        # gateway (tracker.jira.auth: oidc). fullsend run passes the fd to
-        # each pre/post script, only in oidc mode; an unset value is
-        # dropped. Runner only. scripts/lib/jira-auth.lib.sh asks it for a
-        # token on each call, refuses it next to a token or client
-        # credentials, sends the token only to JIRA_API_URL, never
-        # Atlassian, and keeps the fd from children that run agent or
-        # third-party code.
-        FULLSEND_JIRA_OIDC_TOKEN_FD: "${FULLSEND_JIRA_OIDC_TOKEN_FD}"
+        # File for the code-stage result. Newer fullsend sets it and posts
+        # the Jira comment itself after post-code exits; post-code then
+        # writes one line of JSON there and uses no Jira credential. An
+        # unset value is dropped, and post-code falls back to posting with
+        # the token or client credentials above. Runner only.
+        FULLSEND_JIRA_STAGE_RESULT: "${FULLSEND_JIRA_STAGE_RESULT}"
         # `fullsend issues` reads tracker.jira from this directory's config.
         FULLSEND_DIR: "${FULLSEND_DIR}"
         ISSUE_URL: "${FULLSEND_WORK_ITEM_URL}"
