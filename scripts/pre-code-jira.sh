@@ -36,16 +36,28 @@
 #                         used to exclude bot-authored PRs
 set -euo pipefail
 
-# This script uses no Jira token broker: gh, the GitLab API and the
-# pre-commit tool install run around its Jira calls. Should a harness pass
-# one, close its fd and unset the variable before anything else runs.
-if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
-  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
-  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
-    eval "exec $((10#${_jira_broker_fd}))<&-"
+# The Jira token broker fd (FULLSEND_JIRA_OIDC_TOKEN_FD, tracker.jira.auth:
+# oidc) is only for the Jira calls below. Every other child runs without it:
+# helpers that only run in a command substitution close it first, other
+# commands go through _jira_no_broker, and it is closed for good once the
+# last Jira call is done, before anything touches the target repository.
+_jira_close_broker() {
+  local fd="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
+  fd="${fd//[[:space:]]/}"
+  if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
+    eval "exec $((10#${fd}))<&-"
   fi
-  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
-fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  # shellcheck disable=SC2034 # read by jira-auth.lib.sh
+  _JIRA_AUTH_OIDC_FD=""
+}
+# _jira_no_broker CMD... — run CMD in a subshell without the broker fd.
+_jira_no_broker() {
+  (
+    _jira_close_broker
+    "$@"
+  )
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/prescript-output.lib.sh
@@ -83,6 +95,9 @@ prescript_output() {
 # Sanitize a value for safe use in GHA workflow commands (::error::, etc.).
 # Strips ANSI escapes, newlines/carriage returns, and escapes :: to prevent injection.
 _gha_sanitize() {
+  _jira_no_broker _gha_sanitize_now "$1"
+}
+_gha_sanitize_now() {
   printf '%s' "$1" | tr -d '\n\r' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/%/%25/g; s/::/%3A%3A/g'
 }
 
@@ -94,7 +109,7 @@ if [[ ! "${ISSUE_URL}" =~ ^https://[a-zA-Z0-9.-]+/browse/[A-Z][A-Z0-9]*-[0-9]+$ 
   exit 1
 fi
 
-JIRA_HOST="$(echo "${ISSUE_URL}" | sed -E 's|^https://([^/]+)/.*|\1|')"
+JIRA_HOST="$(_jira_no_broker sed -E 's|^https://([^/]+)/.*|\1|' <<< "${ISSUE_URL}")"
 case "${JIRA_HOST}" in
   *.atlassian.net) ;;
   *)
@@ -115,7 +130,7 @@ fi
 JIRA_BASE_URL="${PARSED_BASE_URL}"
 
 # Parse issue key and project from the URL.
-ISSUE_KEY="$(echo "${ISSUE_URL}" | sed -E 's|.*/browse/||')"
+ISSUE_KEY="$(_jira_no_broker sed -E 's|.*/browse/||' <<< "${ISSUE_URL}")"
 PROJECT_KEY="${ISSUE_KEY%-*}"
 
 echo "::notice::🔗 Jira source: $(_gha_sanitize "${ISSUE_URL}") (project=$(_gha_sanitize "${PROJECT_KEY}"), key=$(_gha_sanitize "${ISSUE_KEY}"))"
@@ -1751,14 +1766,17 @@ esac
 # The GitHub check reads the newest 500 open PRs.
 
 # jira-triage-ops.lib.sh exits at load time without Jira credentials, so
-# load it only when a token or a client credential is set. It also exits
+# load it only when a token, a client credential or the token broker fd is
+# set. It also exits
 # when both modes are set, or only one client variable. JIRA_USER_EMAIL is
 # optional.
 JIRA_CREDS_OK=0
 # Test the credentials with xtrace off so the secret is not traced.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 _jira_creds_set=0
-[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]] && _jira_creds_set=1
+_jira_fd_value="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
+[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${_jira_fd_value//[[:space:]]/}" ]] && _jira_creds_set=1
+unset _jira_fd_value
 (( _jira_xtrace_was_on )) && set -x
 unset _jira_xtrace_was_on
 if (( _jira_creds_set )); then
@@ -1796,7 +1814,8 @@ if (( _jira_creds_set )); then
 #                   — or the fd of the token broker fullsend run passes
 #                     (tracker.jira.auth: oidc); asked on each call, and
 #                     the token sent only to JIRA_API_URL, a self-hosted
-#                     Jira gateway. Alone, never with the above.
+#                     Jira gateway. Alone, never with the above. Used by
+#                     pre-triage and pre-code-jira; post-triage closes it.
 #   JIRA_USER_EMAIL — (optional) bot-user email (the triage harness maps
 #                     FULLSEND_JIRA_EMAIL to it). When set, requests use
 #                     Basic auth with email and token; when unset or
@@ -2122,6 +2141,15 @@ jira_auth_drop_oidc_fd() {
 _jira_auth_oidc_fetch() {
   _jira_auth_oidc_fd_open || return 1
   local fd="${_JIRA_AUTH_OIDC_FD}" line="" rc=0 code
+  # Data waiting before a request is a late answer to an earlier one (for
+  # example one that timed out in a command substitution, which closed only
+  # that subshell's copy): the stream is out of step. Close it and fail.
+  if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    eval "exec ${fd}<&-"
+    _JIRA_AUTH_OIDC_FD=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    return 1
+  fi
   if ! { printf '%s\n' "$1" >&"${fd}"; } 2>/dev/null; then
     echo "ERROR: could not send a request to the FULLSEND_JIRA_OIDC_TOKEN_FD token broker" >&2
     return 1
@@ -2931,6 +2959,9 @@ tracker_dispatch_triage() {
   REPO="${PROJECT_KEY}"
   # shellcheck disable=SC2034
   JIRA_ISSUE_NUM="${ISSUE_KEY##*-}"
+elif [[ -n "${FULLSEND_DIR:-}" ]] \
+  && _jira_no_broker grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; then
+  echo "::notice::Jira oidc mode, but this fullsend core passed no token broker (FULLSEND_JIRA_OIDC_TOKEN_FD) — skipping child-issue check and skip comment"
 else
   echo "No Jira credentials set — skipping child-issue check and skip comment"
 fi
@@ -2941,6 +2972,7 @@ SKIP_COMMENT_MARKER="<!-- fullsend:pre-code-jira-skip -->"
 # the first line of TEXT. Parameter expansion instead of `head -1` avoids
 # SIGPIPE on a large TEXT under pipefail.
 _jira_first_line_token() {
+  _jira_close_broker  # runs in a command substitution only
   local first_line="${1%%$'\n'*}"
   printf '%s' "${first_line}" | tr -d '\r' | awk -v n="$2" '{print $n}'
 }
@@ -2966,6 +2998,7 @@ _jira_list_human_prs() {
   local bot="${2%\[bot\]}"
   local coder="${3%\[bot\]}"
   local prs=""
+  _jira_close_broker  # runs in a command substitution only: gh, GitLab
   case "${FULLSEND_FORGE}" in
     github)
       prs="$(gh pr list --repo "${REPO_FULL_NAME}" --state open --limit 500 \
@@ -3020,6 +3053,7 @@ _jira_child_count() {
   resp="$(_jira_api POST "/search/jql" \
     --data "$(jq -cn --arg jql "parent = ${ISSUE_KEY} AND issuetype not in subTaskIssueTypes()" '{jql: $jql, maxResults: 1, fields: ["key"]}')" 2>/dev/null)" \
     || return 1
+  _jira_close_broker  # the Jira call is done; this runs in a substitution
   printf '%s' "${resp}" | jq -er '.issues | length' 2>/dev/null
 }
 
@@ -3043,11 +3077,11 @@ else
   if [[ -n "${EVENT_PAYLOAD_FILE}" ]]; then
     # .comment.body is the full comment ("/fs-code --force ..."); the
     # normalized instruction is the rest of line 1 after the command.
-    _trigger_line="$(jq -r '(.comment.body // "") | (split("\n")[0] // "")' "${EVENT_PAYLOAD_FILE}" 2>/dev/null)" || _trigger_line=""
+    _trigger_line="$(_jira_no_broker jq -r '(.comment.body // "") | (split("\n")[0] // "")' "${EVENT_PAYLOAD_FILE}" 2>/dev/null)" || _trigger_line=""
     if [[ -n "${_trigger_line}" ]]; then
       FORCE_WORD="$(_jira_first_line_token "${_trigger_line}" 2)"
     else
-      _trigger_line="$(jq -r '(._normalized_event.transition.comment.instruction // "") | (split("\n")[0] // "")' "${EVENT_PAYLOAD_FILE}" 2>/dev/null)" || _trigger_line=""
+      _trigger_line="$(_jira_no_broker jq -r '(._normalized_event.transition.comment.instruction // "") | (split("\n")[0] // "")' "${EVENT_PAYLOAD_FILE}" 2>/dev/null)" || _trigger_line=""
       FORCE_WORD="$(_jira_first_line_token "${_trigger_line}" 1)"
     fi
   fi
@@ -3073,8 +3107,8 @@ if [[ "${SKIP_EXISTING_CHECKS}" -eq 0 ]]; then
       if [ "${FULLSEND_FORGE}" = "gitlab" ]; then
         _pr_prefix="!"
       fi
-      FIRST_PR_NUM="$(printf '%s\n' "${HUMAN_PR_LINES}" | head -1 | cut -f1)"
-      FIRST_PR_AUTHOR="$(printf '%s\n' "${HUMAN_PR_LINES}" | head -1 | cut -f2)"
+      FIRST_PR_NUM="$(_jira_close_broker; printf '%s\n' "${HUMAN_PR_LINES}" | head -1 | cut -f1)"
+      FIRST_PR_AUTHOR="$(_jira_close_broker; printf '%s\n' "${HUMAN_PR_LINES}" | head -1 | cut -f2)"
       echo "::notice::Found existing human PR ${_pr_prefix}${FIRST_PR_NUM} by @${FIRST_PR_AUTHOR}"
 
       PR_LIST_MD=""
@@ -3115,6 +3149,10 @@ The code agent implements leaf work items. Use the child issues for implementati
     fi
   fi
 fi
+
+# The Jira calls are done: close the token broker fd for good before git,
+# the pre-commit tool resolver and the installer touch the target repo.
+_jira_close_broker
 
 # ---------------------------------------------------------------------------
 # Auto-detect and install pre-commit tool dependencies

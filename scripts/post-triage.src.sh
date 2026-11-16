@@ -23,6 +23,21 @@
 
 set -euo pipefail
 
+# post-triage Jira writes in oidc mode need core support (follow-up). Close a
+# Jira token broker fd (FULLSEND_JIRA_OIDC_TOKEN_FD) before anything else
+# runs, and say so when it is the only Jira credential.
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  if [[ -n "${_jira_broker_fd}" && -z "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
+    echo "::notice::Jira updates from post-triage are not available in oidc mode yet"
+  fi
+  unset _jira_broker_fd
+fi
+
 # Route Jira-sourced runs to the originating Jira issue. Refuse to run when an
 # explicit tracker or ISSUE_URL points elsewhere, so results never land on a
 # different work item.

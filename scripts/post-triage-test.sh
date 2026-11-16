@@ -3176,6 +3176,35 @@ unset JIRA_USER_EMAIL JIRA_TOKEN JIRA_DUPLICATE_TRANSITION JIRA_NOT_PLANNED_TRAN
 
 # --- Summary ---
 
+# oidc mode: post-triage closes a Jira token broker fd at its first action
+# and logs one notice; its Jira writes in oidc mode need core support
+# (follow-up). With no other Jira credential it then stops as it does
+# without credentials: non-zero exit, no Jira or CLI call, broker not asked.
+PT_OIDC_DIR="${TMPDIR}/run-jira-oidc-post-triage"
+mkdir -p "${PT_OIDC_DIR}/iteration-1/output"
+echo '{"action":"insufficient","reasoning":"missing repro","clarity_scores":{"symptom":0.6,"cause":0.3,"reproduction":0.1,"impact":0.5,"overall":0.39},"comment":"Could you share the steps?"}' \
+  > "${PT_OIDC_DIR}/iteration-1/output/agent-result.json"
+printf 'ok test-header.test-payload.post-triage-unused\n' > "${PT_OIDC_DIR}/broker-answers"
+: > "${JIRA_CURL_LOG}"
+: > "${GH_LOG}"
+pt_oidc_rc=0
+(cd "${PT_OIDC_DIR}" && env -u JIRA_TOKEN -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+  -u GH_TOKEN -u CI_SERVER_HOST -u JIRA_API_URL FULLSEND_TRACKER=jira FULLSEND_FORGE=jira \
+  ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" JIRA_USER_EMAIL="triage@example.com" \
+  FULLSEND_DIR="${TMPDIR}/dot-fullsend" \
+  python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${PT_OIDC_DIR}/broker.log" "${PT_OIDC_DIR}/broker-answers" -- \
+  bash "${POST_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_oidc_rc=$?
+if [[ "${pt_oidc_rc}" -ne 0 ]] \
+  && [[ "$(grep -c "Jira updates from post-triage are not available in oidc mode yet" "${TMPDIR}/stdout.log")" -eq 1 ]] \
+  && [[ ! -s "${JIRA_CURL_LOG}" && ! -s "${GH_LOG}" ]] \
+  && ! grep -q '^request ' "${PT_OIDC_DIR}/broker.log"; then
+  echo "PASS: jira-oidc-post-triage-notice-and-no-jira-writes"
+else
+  echo "FAIL: jira-oidc-post-triage-notice-and-no-jira-writes — rc=${pt_oidc_rc}"
+  cat "${TMPDIR}/stdout.log" "${JIRA_CURL_LOG}" "${GH_LOG}"
+  FAILURES=$((FAILURES + 1))
+fi
+
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then
   echo "${FAILURES} test(s) failed"

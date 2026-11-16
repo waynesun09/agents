@@ -852,6 +852,31 @@ else
   fail "oidc-timeout-closes-broker-fd" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
 fi
 
+# A timeout inside $(...) closes only that subshell's copy of the fd. The
+# late answer then waits on the parent's fd: the next request sees it,
+# closes the fd and fails without asking, and later calls find it closed.
+CASE_BROKER="delay 2 ok ${OIDC_TOKEN}
+ok ${OIDC_TOKEN_2}" run_case oidc-subshell-timeout '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  _JIRA_AUTH_OIDC_TIMEOUT=1
+  out="$(jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself")" || echo first=refused
+  sleep 2
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" || echo second=refused
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" || echo third=refused
+  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo fd=open || echo fd=closed"
+'
+if grep -qx "first=refused" "${CASE_OUT}" && grep -qx "second=refused" "${CASE_OUT}" \
+  && grep -qx "third=refused" "${CASE_OUT}" && grep -qx "fd=closed" "${CASE_OUT}" \
+  && grep -qF "sent data nobody asked for" "${CASE_ERR}" \
+  && grep -qF "token broker is not open" "${CASE_ERR}" \
+  && [[ "$(broker_requests)" -eq 1 && ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+  pass "oidc-subshell-timeout-late-answer-closes-fd"
+else
+  fail "oidc-subshell-timeout-late-answer-closes-fd" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
+assert_oidc_hidden "oidc-subshell-timeout"
+
 # A broker fd value with surrounding whitespace is trimmed, as by
 # jira_auth_select, so jira_auth_drop_oidc_fd still closes it.
 CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-drop-trimmed '

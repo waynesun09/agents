@@ -30,11 +30,11 @@
 #
 # Jira-sourced runs (FULLSEND_TRACKER or FULLSEND_WORK_ITEM_SOURCE is "jira")
 # report the code stage and the PR/MR URL to the Jira issue. With
-# FULLSEND_JIRA_STAGE_RESULT (newer fullsend), the script writes one line of
+# FULLSEND_JIRA_STAGE_RESULT (set by core), the script writes one line of
 # JSON, {"verb":"opened|pushed","url":"<PR/MR URL>"}, to that file and
 # fullsend posts the comment after the script exits; the script then uses
-# no Jira credential, connection setting or CLI. Without it (older fullsend
-# releases), the script posts the comment itself through `fullsend issues`,
+# no Jira credential, connection setting or CLI. With a core that does not
+# set it, the script posts the comment itself through `fullsend issues`,
 # which needs FULLSEND_DIR (whose config.yaml holds tracker.jira) and
 # JIRA_TOKEN: JIRA_USER_EMAIL is optional (set: bot-user Basic auth; unset
 # or empty: service-account Bearer auth), and FULLSEND_JIRA_CLIENT_ID and
@@ -110,13 +110,22 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
+  # Core posts the stage comment: no Jira credential is needed here at all.
+  if [[ -n "${_jira_stage_result_saved}" ]]; then
+    _jira_token_saved=""
+    _jira_email_saved=""
+    _jira_client_id_saved=""
+    _jira_client_secret_saved=""
+  fi
 elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}${FULLSEND_JIRA_STAGE_RESULT:-}" ]]; then
   # post-code never uses a Jira token broker. Should a harness still pass
   # one, close its fd here, before anything else runs, and keep only the
   # fact that the run is in oidc mode, for the error message below.
   if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
-    _jira_oidc_seen=1
     _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+    if [[ -n "${_jira_broker_fd}" ]]; then
+      _jira_oidc_seen=1
+    fi
     if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
       eval "exec $((10#${_jira_broker_fd}))<&-"
     fi
@@ -587,7 +596,7 @@ post_jira_stage_update() {
     gha_echo error "JIRA_BASE_URL does not match the Jira host in FULLSEND_WORK_ITEM_URL"
     return 1
   fi
-  # Newer fullsend posts the comment itself after this script exits: hand
+  # A core that sets it posts the comment after this script exits: hand
   # it the verb and the PR/MR URL, and use no Jira credential, connection
   # setting or CLI here.
   if [ -n "${_jira_stage_result_saved}" ]; then
@@ -602,7 +611,7 @@ post_jira_stage_update() {
     fi
     return 0
   fi
-  # Older fullsend: post the comment here. The credentials were withheld
+  # A core that does not set it: post the comment here. The credentials were withheld
   # from the environment at the start of the script (see "Jira credential
   # isolation"); they are passed to the trusted CLI below and nowhere else.
   # The email is optional: without it the CLI uses service-account Bearer

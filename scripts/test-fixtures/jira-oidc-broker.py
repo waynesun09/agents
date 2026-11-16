@@ -7,7 +7,8 @@ Creates a socketpair, as fullsend run does, and runs COMMAND with one end
 inherited and FULLSEND_JIRA_OIDC_TOKEN_FD set to its number. The other end
 is served in a thread: each request line is logged to LOG (the request,
 never a token), and answered with the next line of RESPONSES. Special
-response lines: "hang" sends nothing, "close" closes the broker end.
+response lines: "hang" sends nothing, "close" closes the broker end,
+"delay N LINE" sends LINE after N seconds.
 Lines are sent with a trailing newline. Exits with COMMAND's exit code.
 
 The first LOG line is "inode socket:[N]", the inode of the end the command
@@ -19,6 +20,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 
 def serve(sock, log_path, responses):
@@ -38,6 +40,9 @@ def serve(sock, log_path, responses):
             if response == "close":
                 sock.close()
                 return
+            if response.startswith("delay "):
+                _, seconds, response = response.split(" ", 2)
+                time.sleep(float(seconds))
             sock.sendall(response.encode("ascii") + b"\n")
         # Out of scripted responses: refuse further requests.
         while True:

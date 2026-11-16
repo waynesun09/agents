@@ -3679,7 +3679,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/git"
 # gitleaks stand-in that also records whether it holds the broker fd.
 cat > "${JIRA_INT_MOCK_BIN}/gitleaks" <<MOCKEOF
 #!/usr/bin/env bash
-echo "gitleaks var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "gitleaks var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 if [ "\${1:-}" = version ]; then echo 8.30.1; fi
 exit 0
 MOCKEOF
@@ -3689,7 +3689,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/gitleaks"
 cat > "${JIRA_INT_MOCK_BIN}/gh" <<MOCKEOF
 #!/usr/bin/env bash
 echo "gh \$*" >> "${JIRA_INT_FORGE_LOG}"
-echo "gh var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "gh var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 case "\$1 \$2" in
   "api -X")      echo "unexpected Git Data API call: \$*" >&2; exit 99 ;;
   "api repos/"*) echo "main"; exit 0 ;;
@@ -3760,7 +3760,7 @@ if [[ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
     broker="answered-\${reply%% *}"
   fi
 fi
-echo "fullsend var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "fullsend var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 echo "fullsend \$* env-token=\${FULLSEND_JIRA_TOKEN:-unset} env-email=\${FULLSEND_JIRA_EMAIL-unset} env-client-id=\${FULLSEND_JIRA_CLIENT_ID-unset} env-client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} broker-var-present=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set} broker=\${broker} <<BODY:\${BODY}:BODY>>" >> "${JIRA_INT_FULLSEND_LOG}"
 if [[ -n "\${MOCK_FULLSEND_FAIL:-}" ]]; then
   echo "Error: Jira API returned 401" >&2
@@ -3774,7 +3774,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/fullsend"
 cat > "${JIRA_INT_MOCK_BIN}/pre-commit" <<MOCKEOF
 #!/usr/bin/env bash
 echo "pre-commit jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set}" >> "${JIRA_INT_PRECOMMIT_LOG}"
-echo "pre-commit var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "pre-commit var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 exit 0
 MOCKEOF
 chmod +x "${JIRA_INT_MOCK_BIN}/pre-commit"
@@ -3798,9 +3798,12 @@ setup_jira_int_repo() {
     ${JIRA_REAL_GIT} -C "${repo_dir}" push -q origin main
   fi
   ${JIRA_REAL_GIT} -C "${repo_dir}" checkout -q -b "${branch_name}"
-  echo "changed content" > "${repo_dir}/file.txt"
-  ${JIRA_REAL_GIT} -C "${repo_dir}" add -f file.txt
-  ${JIRA_REAL_GIT} -C "${repo_dir}" commit -q -m "fix: test change"
+  # JIRA_INT_NO_CHANGE=1: the agent made no commit (a no-op run).
+  if [ -z "${JIRA_INT_NO_CHANGE:-}" ]; then
+    echo "changed content" > "${repo_dir}/file.txt"
+    ${JIRA_REAL_GIT} -C "${repo_dir}" add -f file.txt
+    ${JIRA_REAL_GIT} -C "${repo_dir}" commit -q -m "fix: test change"
+  fi
   if [ -n "${JIRA_INT_PREPUSH_HOOK:-}" ]; then
     write_jira_int_hook "${repo_dir}/.git/hooks/pre-push" pre-push "${JIRA_INT_PREPUSH_HOOK}"
   fi
@@ -3828,7 +3831,7 @@ for pid in "\${PPID}" "\${gp}"; do
   fi
 done
 echo "${hook_name} jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} proc-environ-leak=\${leak} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set}" >> "${log_path}"
-echo "${hook_name} var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "${hook_name} var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 exit 0
 HOOKEOF
   chmod +x "${hook_path}"
@@ -4207,18 +4210,28 @@ else
   if [ "${JIRA_INT_RC}" -ne 0 ] || [ ! -s "${JIRA_RESULT_FILE}" ]; then
     jira_int_fail "jira-stage-result-no-broker-fd-in-children" "post-code failed or wrote no result"
   elif [ -z "${_jr_inode}" ] || grep -qF -- "${_jr_inode}" "${JIRA_INT_FD_LOG}" \
-       || grep -qvF ' var=unset fds=' "${JIRA_INT_FD_LOG}" \
+       || grep -qvF ' var=unset stage=unset fds=' "${JIRA_INT_FD_LOG}" \
        || ! grep -q '^pre-commit ' "${JIRA_INT_FD_LOG}" || ! grep -q '^pre-push ' "${JIRA_INT_FD_LOG}" \
        || ! grep -q '^gh ' "${JIRA_INT_FD_LOG}" || ! grep -q '^gitleaks ' "${JIRA_INT_FD_LOG}" \
        || grep -q '^request ' "${JIRA_INT_BROKER_LOG}"; then
     cat "${JIRA_INT_FD_LOG}"
-    jira_int_fail "jira-stage-result-no-broker-fd-in-children" "a child held the broker fd or its variable, or the broker was asked"
+    jira_int_fail "jira-stage-result-no-broker-fd-in-children" "a child held the broker fd, its variable or FULLSEND_JIRA_STAGE_RESULT, or the broker was asked"
   else
     echo "PASS: jira-stage-result-no-broker-fd-in-children"
   fi
 fi
 
-# oidc mode on an older fullsend (no result variable) cannot post the
+# A no-op run (no agent commit) opens no PR/MR and leaves the result empty.
+JIRA_INT_NO_CHANGE=1 run_jira_result "jira-stage-result-no-op" github
+if [ "${JIRA_INT_RC}" -ne 0 ]; then
+  jira_int_fail "jira-stage-result-no-op-leaves-file-empty" "post-code failed"
+elif [ -s "${JIRA_RESULT_FILE}" ] || ! jira_result_no_jira_call; then
+  jira_int_fail "jira-stage-result-no-op-leaves-file-empty" "result is '$(cat "${JIRA_RESULT_FILE}")', or a Jira call was made"
+else
+  echo "PASS: jira-stage-result-no-op-leaves-file-empty"
+fi
+
+# oidc mode on a core that does not set the result variable cannot post the
 # comment: post-code fails with a clear message and calls no CLI. The mode
 # is recognised from a broker fd, or from tracker.jira.auth: oidc.
 JIRA_OIDC_CONFIG_DIR="${JIRA_INT_TMPDIR}/dot-fullsend-oidc"

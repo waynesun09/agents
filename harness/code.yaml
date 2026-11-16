@@ -209,12 +209,21 @@ overlays:
         # scripts/lib/jira-auth.lib.sh refuses them next to a token.
         FULLSEND_JIRA_CLIENT_ID: "${FULLSEND_JIRA_CLIENT_ID}"
         FULLSEND_JIRA_CLIENT_SECRET: "${FULLSEND_JIRA_CLIENT_SECRET}"
-        # File for the code-stage result. Newer fullsend sets it and posts
-        # the Jira comment itself after post-code exits; post-code then
-        # writes one line of JSON there and uses no Jira credential. An
-        # unset value is dropped, and post-code falls back to posting with
-        # the token or client credentials above. Runner only.
+        # These Jira keys need a fullsend core release that treats them as
+        # optional runner keys (the first core release with the Jira oidc
+        # mode); older cores fail the run on an unset reference.
+        # File for the code-stage result. A core that sets it posts the Jira
+        # comment itself after post-code exits; post-code then writes one
+        # line of JSON there and uses no Jira credential. With a core that
+        # does not set it, the value is dropped and post-code posts with the
+        # token or client credentials above. Runner only.
         FULLSEND_JIRA_STAGE_RESULT: "${FULLSEND_JIRA_STAGE_RESULT}"
+        # fd number of the CI OIDC token broker for a self-hosted Jira
+        # gateway (tracker.jira.auth: oidc), passed only in oidc mode; an
+        # unset value is dropped. Runner only. pre-code-jira uses it for its
+        # Jira calls and closes it for every other child; post-code closes
+        # it as its first action.
+        FULLSEND_JIRA_OIDC_TOKEN_FD: "${FULLSEND_JIRA_OIDC_TOKEN_FD}"
         # `fullsend issues` reads tracker.jira from this directory's config.
         FULLSEND_DIR: "${FULLSEND_DIR}"
         ISSUE_URL: "${FULLSEND_WORK_ITEM_URL}"

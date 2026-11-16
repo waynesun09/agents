@@ -31,11 +31,10 @@
 #                            REST calls then use an access token minted on
 #                            the runner and need JIRA_API_URL. Setting both
 #                            modes fails.
-#   FULLSEND_JIRA_OIDC_TOKEN_FD
-#                          — or the fd of the token broker fullsend run passes
-#                            (tracker.jira.auth: oidc); asked on each call, and
-#                            the token sent only to JIRA_API_URL, a self-hosted
-#                            Jira gateway. Alone, never with the above.
+#
+# Scribe has no Jira oidc support yet: a token broker fd
+# (FULLSEND_JIRA_OIDC_TOKEN_FD) is refused here, and pre-scribe closes one
+# before anything else runs.
 #   FULLSEND_DIR           — .fullsend directory whose config.yaml holds
 #                            tracker.jira, for `fullsend issues create`
 #   SCRIBE_JIRA_PROJECT    — Jira project key that backlog reads and new
@@ -66,9 +65,14 @@ JIRA_SCRIBE_OPS_SH_LOADED=1
 # JIRA_USER_EMAIL is optional: without it, requests use Bearer auth.
 # shellcheck source=jira-auth.lib.sh
 source "${SCRIPT_DIR}/lib/jira-auth.lib.sh"
+_scribe_jira_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
+if [[ -n "${_scribe_jira_fd//[[:space:]]/}" ]]; then
+  echo "ERROR: scribe has no Jira oidc support yet; set JIRA_TOKEN, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET" >&2
+  exit 1
+fi
 jira_auth_select "${JIRA_TOKEN:-}" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
 if [[ "${JIRA_AUTH_MODE}" == "none" ]]; then
-  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD" >&2
+  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET (scribe has no Jira oidc support yet)" >&2
   exit 1
 fi
 : "${JIRA_BASE_URL:?JIRA_BASE_URL must be set}"

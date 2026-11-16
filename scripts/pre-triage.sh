@@ -664,7 +664,8 @@ tracker_dispatch_triage() {
 #                   — or the fd of the token broker fullsend run passes
 #                     (tracker.jira.auth: oidc); asked on each call, and
 #                     the token sent only to JIRA_API_URL, a self-hosted
-#                     Jira gateway. Alone, never with the above.
+#                     Jira gateway. Alone, never with the above. Used by
+#                     pre-triage and pre-code-jira; post-triage closes it.
 #   JIRA_USER_EMAIL — (optional) bot-user email (the triage harness maps
 #                     FULLSEND_JIRA_EMAIL to it). When set, requests use
 #                     Basic auth with email and token; when unset or
@@ -990,6 +991,15 @@ jira_auth_drop_oidc_fd() {
 _jira_auth_oidc_fetch() {
   _jira_auth_oidc_fd_open || return 1
   local fd="${_JIRA_AUTH_OIDC_FD}" line="" rc=0 code
+  # Data waiting before a request is a late answer to an earlier one (for
+  # example one that timed out in a command substitution, which closed only
+  # that subshell's copy): the stream is out of step. Close it and fail.
+  if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    eval "exec ${fd}<&-"
+    _JIRA_AUTH_OIDC_FD=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    return 1
+  fi
   if ! { printf '%s\n' "$1" >&"${fd}"; } 2>/dev/null; then
     echo "ERROR: could not send a request to the FULLSEND_JIRA_OIDC_TOKEN_FD token broker" >&2
     return 1

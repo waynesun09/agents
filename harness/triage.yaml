@@ -161,14 +161,17 @@ overlays:
         # scripts/lib/jira-auth.lib.sh refuses them next to a token.
         FULLSEND_JIRA_CLIENT_ID: ${FULLSEND_JIRA_CLIENT_ID}
         FULLSEND_JIRA_CLIENT_SECRET: ${FULLSEND_JIRA_CLIENT_SECRET}
+        # These Jira keys need a fullsend core release that treats them as
+        # optional runner keys (the first core release with the Jira oidc
+        # mode); older cores fail the run on an unset reference.
         # fd number of the CI OIDC token broker for a self-hosted Jira
-        # gateway (tracker.jira.auth: oidc). fullsend run passes the fd to
-        # each pre/post script, only in oidc mode; an unset value is
-        # dropped. Runner only. scripts/lib/jira-auth.lib.sh asks it for a
-        # token on each call, refuses it next to a token or client
-        # credentials, sends the token only to JIRA_API_URL, never
-        # Atlassian, and keeps the fd from children that run agent or
-        # third-party code.
+        # gateway (tracker.jira.auth: oidc), passed only in oidc mode; an
+        # unset value is dropped. Runner only. pre-triage asks it for a
+        # token on each Jira call (scripts/lib/jira-auth.lib.sh refuses it
+        # next to a token or client credentials and sends the token only to
+        # JIRA_API_URL, never Atlassian). post-triage closes it as its first
+        # action: its Jira writes in oidc mode need core support
+        # (follow-up).
         FULLSEND_JIRA_OIDC_TOKEN_FD: ${FULLSEND_JIRA_OIDC_TOKEN_FD}
         # `fullsend issues` reads tracker.jira from this directory's config.
         FULLSEND_DIR: ${FULLSEND_DIR}

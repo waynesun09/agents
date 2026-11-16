@@ -31,7 +31,8 @@
 #                   — or the fd of the token broker fullsend run passes
 #                     (tracker.jira.auth: oidc); asked on each call, and
 #                     the token sent only to JIRA_API_URL, a self-hosted
-#                     Jira gateway. Alone, never with the above.
+#                     Jira gateway. Alone, never with the above. Used by
+#                     pre-triage and pre-code-jira; post-triage closes it.
 #   JIRA_USER_EMAIL — (optional) bot-user email (the triage harness maps
 #                     FULLSEND_JIRA_EMAIL to it). When set, requests use
 #                     Basic auth with email and token; when unset or

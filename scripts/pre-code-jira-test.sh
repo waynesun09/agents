@@ -22,6 +22,8 @@ trap 'rm -rf "${TMPDIR}"' EXIT
 PRESCRIPT_OUT="${TMPDIR}/prescript.out"
 FULLSEND_CALLS="${TMPDIR}/fullsend-calls.log"
 CURL_ARGV_LOG="${TMPDIR}/curl-argv.log"
+CHILD_FD_LOG="${TMPDIR}/child-fds.log"
+BROKER_LOG="${TMPDIR}/broker.log"
 PAYLOAD_DIR="${TMPDIR}/fullsend-dir/dispatch"
 
 # --- Helpers ---
@@ -36,6 +38,7 @@ build_mock() {
   # Mock gh: `gh pr list` prints MOCK_GH_PRS (default: no PRs).
   cat > "${mock_bin}/gh" <<'GHEOF'
 #!/usr/bin/env bash
+echo "gh var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 if [[ "$1 $2" == "pr list" ]]; then
   [[ "${MOCK_GH_FAIL:-}" == "1" ]] && exit 1
   printf '%s\n' "${MOCK_GH_PRS:-[]}"
@@ -52,6 +55,8 @@ data=""
 prev=""
 for arg in "$@"; do
   [[ "${prev}" == "--data" ]] && data="${arg}"
+  # oidc mode: the Authorization header comes in a curl config.
+  [[ "${prev}" == "--config" ]] && cat "${arg}" >> "${CURL_ARGV_LOG}.config"
   prev="${arg}"
 done
 for arg in "$@"; do
@@ -102,6 +107,9 @@ CURLEOF
 {
   echo "ARGS: $*"
   echo "ENV: token=${FULLSEND_JIRA_TOKEN-unset} id=${FULLSEND_JIRA_CLIENT_ID-unset} secret=${FULLSEND_JIRA_CLIENT_SECRET:+set}"
+  if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+    echo "OIDC: var=set fd=$({ : >&"${FULLSEND_JIRA_OIDC_TOKEN_FD}"; } 2>/dev/null && echo open || echo closed)"
+  fi
   echo "BODY:"
   cat
 } >> "${FULLSEND_CALLS}"
@@ -112,6 +120,7 @@ FSEOF
   # Mock git (needed for pre-commit tool resolution)
   cat > "${mock_bin}/git" <<'GITEOF'
 #!/usr/bin/env bash
+echo "git var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 exit 1
 GITEOF
   chmod +x "${mock_bin}/git"
@@ -119,6 +128,12 @@ GITEOF
   # Mock python3 (needed for resolve-precommit-tools.py)
   cat > "${mock_bin}/python3" <<'PYEOF'
 #!/usr/bin/env bash
+echo "python3 var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+# MOCK_PY_MANIFEST: print it as the resolved tool manifest.
+if [[ -n "${MOCK_PY_MANIFEST:-}" ]]; then
+  printf '%s\n' "${MOCK_PY_MANIFEST}"
+  exit 0
+fi
 exit 1
 PYEOF
   chmod +x "${mock_bin}/python3"
@@ -144,6 +159,7 @@ base_env() {
   echo "FULLSEND_PRESCRIPT_OUTPUT=${PRESCRIPT_OUT}"
   echo "FULLSEND_CALLS=${FULLSEND_CALLS}"
   echo "CURL_ARGV_LOG=${CURL_ARGV_LOG}"
+  echo "CHILD_FD_LOG=${CHILD_FD_LOG}"
   echo "COMMENT_BODY="
   echo "CODE_FORCE="
 }
@@ -154,7 +170,8 @@ run_script() {
 
   local mock_bin
   mock_bin="$(build_mock)"
-  rm -f "${PRESCRIPT_OUT}" "${FULLSEND_CALLS}" "${CURL_ARGV_LOG}"
+  rm -f "${PRESCRIPT_OUT}" "${FULLSEND_CALLS}" "${CURL_ARGV_LOG}" "${CURL_ARGV_LOG}.config" \
+    "${CHILD_FD_LOG}" "${BROKER_LOG}"
 
   local env_cmd=(env)
 
@@ -175,9 +192,17 @@ run_script() {
     env_cmd+=("COMMENT_BODY=${TEST_COMMENT_BODY}")
   fi
 
+  # RUN_BROKER (answers, one per line) runs the script under the fake Jira
+  # token broker, which sets FULLSEND_JIRA_OIDC_TOKEN_FD.
+  local broker=()
+  if [[ -n "${RUN_BROKER:-}" ]]; then
+    printf '%s\n' "${RUN_BROKER}" > "${TMPDIR}/broker-answers"
+    broker=(python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${BROKER_LOG}" "${TMPDIR}/broker-answers" --)
+  fi
+
   RUN_EXIT=0
   # RUN_XTRACE=1 runs the script under bash -x.
-  "${env_cmd[@]}" bash ${RUN_XTRACE:+-x} "${PRE_SCRIPT}" > "${TMPDIR}/stdout.log" 2>&1 || RUN_EXIT=$?
+  ${broker[@]+"${broker[@]}"} "${env_cmd[@]}" bash ${RUN_XTRACE:+-x} "${PRE_SCRIPT}" > "${TMPDIR}/stdout.log" 2>&1 || RUN_EXIT=$?
 }
 
 run_test() {
@@ -576,6 +601,93 @@ run_test "one-client-variable-fails" \
   "JIRA_TOKEN=
 JIRA_API_URL=${GATEWAY_URL}
 FULLSEND_JIRA_CLIENT_ID=client-id-1"
+
+# --- Test cases: CI OIDC token broker (tracker.jira.auth: oidc) ---
+
+OIDC_GATEWAY="https://jira-gw.example.com/ex/jira/cloud-1"
+OIDC_TOKEN_VALUE="test-header.test-payload.pre-code-jira-oidc"
+OIDC_ENV="JIRA_TOKEN=
+JIRA_API_URL=${OIDC_GATEWAY}
+MOCK_JIRA_EXPECT_API_URL=${OIDC_GATEWAY}"
+
+# The child-issue check sends the broker's token to the gateway, and the
+# skip comment's CLI call inherits the broker fd; gh does not.
+RUN_BROKER="ok ${OIDC_TOKEN_VALUE}" run_skip_test "oidc-child-check-through-broker" \
+  true \
+  "reason=PROJ-42 has child issue(s)" \
+  "MOCK_JIRA_CHILDREN=${HAS_CHILDREN}
+${OIDC_ENV}"
+if grep -qxF "header = \"Authorization: Bearer ${OIDC_TOKEN_VALUE}\"" "${CURL_ARGV_LOG}.config" 2>/dev/null \
+   && [[ "$(grep -c '^request token$' "${BROKER_LOG}")" -eq 1 ]] \
+   && grep -qx "OIDC: var=set fd=open" "${FULLSEND_CALLS}" \
+   && grep -qx "ENV: token=unset id=unset secret=" "${FULLSEND_CALLS}" \
+   && grep -qx "gh var=unset fd=closed" "${CHILD_FD_LOG}" \
+   && ! grep -qF "${OIDC_TOKEN_VALUE}" "${CURL_ARGV_LOG}" "${FULLSEND_CALLS}" "${TMPDIR}/stdout.log"; then
+  echo "PASS: oidc-child-check-and-skip-comment-use-broker"
+else
+  echo "FAIL: oidc-child-check-and-skip-comment-use-broker — expected the broker token at the gateway, the fd for the CLI only, and no token in argv or output"
+  cat "${CURL_ARGV_LOG}" "${CURL_ARGV_LOG}.config" "${FULLSEND_CALLS}" "${CHILD_FD_LOG}" "${BROKER_LOG}" "${TMPDIR}/stdout.log" 2>/dev/null || true
+  FAILURES=$((FAILURES + 1))
+fi
+
+# The PR-skip comment goes through the broker too (the CLI holds the fd).
+RUN_BROKER="ok ${OIDC_TOKEN_VALUE}" run_skip_test "oidc-pr-skip-comment-through-broker" \
+  true \
+  "reason=open PR #7 by @alice" \
+  "MOCK_GH_PRS=${HUMAN_PR_URL_BODY}
+${OIDC_ENV}"
+if grep -qx "OIDC: var=set fd=open" "${FULLSEND_CALLS}" && grep -qx "gh var=unset fd=closed" "${CHILD_FD_LOG}"; then
+  echo "PASS: oidc-pr-skip-comment-cli-holds-fd-gh-does-not"
+else
+  echo "FAIL: oidc-pr-skip-comment-cli-holds-fd-gh-does-not"
+  cat "${FULLSEND_CALLS}" "${CHILD_FD_LOG}" "${TMPDIR}/stdout.log" 2>/dev/null || true
+  FAILURES=$((FAILURES + 1))
+fi
+
+# gh, git, python3 (the tool resolver) and the tool installer run without
+# the broker fd or its variable.
+OIDC_WS="${TMPDIR}/workspace"
+mkdir -p "${OIDC_WS}/scripts" "${OIDC_WS}/target-repo"
+: > "${OIDC_WS}/scripts/resolve-precommit-tools.py"
+cat > "${OIDC_WS}/scripts/install-precommit-tools.sh" <<'INSTEOF'
+#!/usr/bin/env bash
+echo "install var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG}"
+INSTEOF
+printf 'repos: []\n' > "${OIDC_WS}/target-repo/.pre-commit-config.yaml"
+RUN_BROKER="ok ${OIDC_TOKEN_VALUE}" run_skip_test "oidc-run-proceeds" \
+  false \
+  "No child issues found" \
+  "MOCK_PY_MANIFEST={\"tools\":[{\"name\":\"t\"}]}
+${OIDC_ENV}"
+oidc_children_ok=true
+for child in gh git python3 install; do
+  grep -qx "${child} var=unset fd=closed" "${CHILD_FD_LOG}" || oidc_children_ok=false
+done
+if ${oidc_children_ok} && ! grep -qv " var=unset fd=closed$" "${CHILD_FD_LOG}" \
+   && [[ "$(grep -c '^request token$' "${BROKER_LOG}")" -eq 1 ]]; then
+  echo "PASS: oidc-children-do-not-inherit-broker-fd"
+else
+  echo "FAIL: oidc-children-do-not-inherit-broker-fd — gh, git, python3 and the installer must run without the fd or its variable"
+  cat "${CHILD_FD_LOG}" "${BROKER_LOG}" "${TMPDIR}/stdout.log" 2>/dev/null || true
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "${OIDC_WS}/scripts" "${OIDC_WS}/target-repo"
+
+# oidc mode without a broker fd (a core that passes none): a notice, not
+# "No Jira credentials set", and the run proceeds.
+mkdir -p "${TMPDIR}/fullsend-dir"
+printf 'tracker:\n  jira:\n    base_url: https://acme.atlassian.net\n    auth: oidc\n' > "${TMPDIR}/fullsend-dir/config.yaml"
+run_skip_test "oidc-without-broker-fd-logs-notice" \
+  false \
+  "this fullsend core passed no token broker (FULLSEND_JIRA_OIDC_TOKEN_FD)" \
+  "JIRA_TOKEN="
+if grep -qF "No Jira credentials set" "${TMPDIR}/stdout.log"; then
+  echo "FAIL: oidc-without-broker-fd-no-generic-message — the generic no-credentials message was logged"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: oidc-without-broker-fd-no-generic-message"
+fi
+rm -f "${TMPDIR}/fullsend-dir/config.yaml"
 
 # --- Summary ---
 
