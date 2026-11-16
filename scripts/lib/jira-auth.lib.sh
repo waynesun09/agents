@@ -267,8 +267,7 @@ _jira_auth_oidc_fd_open() {
 # (git and its hooks, pre-commit and its installs, gitleaks, gh) must not
 # hold the fd, so call this before starting them; to keep the fd for later
 # Jira calls, call it in a subshell: ( jira_auth_drop_oidc_fd; gh ... ).
-# The close goes through eval because bash before 4.1 has no {var}<&- form
-# for a fd number held in a variable. A no-op when no fd is set.
+# A no-op when no fd is set.
 jira_auth_drop_oidc_fd() {
   local fd
   for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
@@ -287,10 +286,17 @@ jira_auth_drop_oidc_fd() {
 # stream is out of step. Close the fd and fail. read -t 0 needs bash 4 or
 # later; jira_auth_select refuses the broker fd on an older bash.
 _jira_auth_oidc_check_pending() {
-  local fd="${_JIRA_AUTH_OIDC_FD}"
+  local fd="${_JIRA_AUTH_OIDC_FD}" byte="" rc=0
   if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    # Readable with nothing to read is end of file: the broker closed.
+    IFS= read -r -n 1 -t 1 byte <&"${fd}" 2>/dev/null || rc=$?
     jira_auth_drop_oidc_fd
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    if [[ "${rc}" -eq 1 && -z "${byte}" ]]; then
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
+    else
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    fi
+    byte=""
     return 1
   fi
 }
@@ -319,6 +325,7 @@ _jira_auth_oidc_fetch() {
     return 1
   fi
   if (( rc != 0 )); then
+    jira_auth_drop_oidc_fd
     if [[ -z "${line}" ]]; then
       echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
     else

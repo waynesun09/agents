@@ -94,6 +94,7 @@ set -euo pipefail
 # hook could read without that.
 # ---------------------------------------------------------------------------
 _jira_token_saved=""
+_jira_fullsend_token_saved=""
 _jira_email_saved=""
 _jira_client_id_saved=""
 _jira_client_secret_saved=""
@@ -106,13 +107,15 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
   unset _POST_CODE_JIRA_FD
   { IFS= read -r -d '' _jira_token_saved || true; IFS= read -r -d '' _jira_email_saved || true
     IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true
-    IFS= read -r -d '' _jira_oidc_seen || true; IFS= read -r -d '' _jira_stage_result_saved || true; } \
+    IFS= read -r -d '' _jira_oidc_seen || true; IFS= read -r -d '' _jira_stage_result_saved || true
+    IFS= read -r -d '' _jira_fullsend_token_saved || true; } \
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
   # Core posts the stage comment: no Jira credential is needed here at all.
   if [[ -n "${_jira_stage_result_saved}" ]]; then
     _jira_token_saved=""
+    _jira_fullsend_token_saved=""
     _jira_email_saved=""
     _jira_client_id_saved=""
     _jira_client_secret_saved=""
@@ -120,11 +123,20 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
 elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}${FULLSEND_JIRA_STAGE_RESULT:-}" ]]; then
   # post-code never uses a Jira token broker. Should a harness still pass
   # one, close its fd here, before anything else runs, and keep only the
-  # fact that the run is in oidc mode, for the error message below.
+  # fact that the run is in oidc mode, for the error message below. Next to
+  # a static Jira credential it is a conflict: fail now, before any git,
+  # forge or Jira work, also when fullsend posts the stage comment.
   if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
     _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
     if [[ -n "${_jira_broker_fd}" ]]; then
       _jira_oidc_seen=1
+      _jira_static="${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}"
+      _jira_static="${_jira_static//[[:space:]]/}"
+      if [[ -n "${_jira_static}" ]]; then
+        echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" >&2
+        exit 1
+      fi
+      unset _jira_static
     fi
     if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
       eval "exec $((10#${_jira_broker_fd}))<&-"
@@ -134,9 +146,9 @@ elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEN
   _jira_stash_file="$(mktemp)"
   exec {_jira_stash_fd}<>"${_jira_stash_file}"
   rm -f "${_jira_stash_file}"
-  printf '%s\0%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
     "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" \
-    "${_jira_oidc_seen}" "${FULLSEND_JIRA_STAGE_RESULT-}" >&"${_jira_stash_fd}"
+    "${_jira_oidc_seen}" "${FULLSEND_JIRA_STAGE_RESULT-}" "${FULLSEND_JIRA_TOKEN-}" >&"${_jira_stash_fd}"
   exec env -u JIRA_TOKEN -u JIRA_USER_EMAIL -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL \
     -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
     -u FULLSEND_JIRA_OIDC_TOKEN_FD -u FULLSEND_JIRA_STAGE_RESULT \
@@ -611,6 +623,7 @@ post_jira_stage_update() {
         return 1
         ;;
     esac
+    local LC_ALL=C
     if [[ ! "${pr_url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]+/(pull|-/merge_requests)/[1-9][0-9]*$ ]]; then
       gha_echo error "The PR/MR URL is not in the expected shape for the Jira stage result"
       return 1

@@ -116,11 +116,6 @@ check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_DIR '${FULLSEND_DIR}'
 # their own names, so jira-auth.lib.sh and the fullsend CLI read them.
 check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_CLIENT_ID '${FULLSEND_JIRA_CLIENT_ID}'
 check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_CLIENT_SECRET '${FULLSEND_JIRA_CLIENT_SECRET}'
-# The fd of the CI OIDC token broker for a self-hosted Jira gateway
-# (tracker.jira.auth: oidc): fullsend run passes it to each pre/post script
-# only when env.runner declares it, so it must be mapped under its own name
-# for jira-auth.lib.sh and the fullsend CLI.
-check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_OIDC_TOKEN_FD '${FULLSEND_JIRA_OIDC_TOKEN_FD}'
 
 # The real FULLSEND_JIRA_* values (token, email, client ID and secret) must
 # never reach the sandbox, so no sandbox env, Jira host file or provider
@@ -251,7 +246,8 @@ check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_STAGE_RESULT '${FULLSE
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_OIDC_TOKEN_FD '${FULLSEND_JIRA_OIDC_TOKEN_FD}'
 
 # No harness maps any FULLSEND_JIRA_OIDC_* name but the broker fd, and that
-# only in env.runner of the Jira overlay of code and triage.
+# only in env.runner of the Jira overlay of the code harness: triage has no
+# Jira oidc support yet.
 # FULLSEND_JIRA_STAGE_RESULT is mapped only there in the code harness. Every string in the file is listed with its
 # path, so a key or a value anywhere counts.
 for f in "${REPO_ROOT}"/harness/*.yaml; do
@@ -261,12 +257,6 @@ for f in "${REPO_ROOT}"/harness/*.yaml; do
   stage="$(grep -F "FULLSEND_JIRA_STAGE_RESULT" <<< "${strings}" || true)"
   ok=false
   case "${name}" in
-    triage)
-      if [[ -z "${stage}" && "${got}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_OIDC_TOKEN_FD=\$\{FULLSEND_JIRA_OIDC_TOKEN_FD\}$ ]] \
-        && yq -r ".overlays[${BASH_REMATCH[1]}].when" "${f}" | grep -qF '"jira"'; then
-        ok=true
-      fi
-      ;;
     code)
       if [[ "${got}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_OIDC_TOKEN_FD=\$\{FULLSEND_JIRA_OIDC_TOKEN_FD\}$ ]] \
         && fd_overlay="${BASH_REMATCH[1]}" \

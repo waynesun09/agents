@@ -28,9 +28,9 @@ cat > "${MOCK_BIN}/gh" <<MOCKEOF
 # test's broker passed (TEST_BROKER_FD).
 if [[ -n "\${BROKER_PROBE_LOG:-}" && -n "\${TEST_BROKER_FD:-}" ]]; then
   if { : >&"\${TEST_BROKER_FD}"; } 2>/dev/null; then
-    echo "gh fd=open var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" >> "\${BROKER_PROBE_LOG}"
+    echo "gh fd=open var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset)" >> "\${BROKER_PROBE_LOG}"
   else
-    echo "gh fd=closed var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" >> "\${BROKER_PROBE_LOG}"
+    echo "gh fd=closed var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset)" >> "\${BROKER_PROBE_LOG}"
   fi
 fi
 # When querying the repo labels list, return a set of known test labels so that
@@ -3259,6 +3259,31 @@ else
   cat "${TMPDIR}/stdout.log" "${PT_PROBE_LOG}"
   FAILURES=$((FAILURES + 1))
 fi
+
+# A whitespace-only token next to the broker fd is no conflict: the run is
+# in oidc mode and stops with the oidc error. The tracker also counts when
+# it comes from FULLSEND_FORGE alone.
+for pt_case in "tracker|FULLSEND_TRACKER=jira" "forge|FULLSEND_FORGE=jira"; do
+  pt_name="${pt_case%%|*}"
+  : > "${JIRA_CURL_LOG}"
+  : > "${GH_LOG}"
+  pt_rc=0
+  (cd "${PT_OIDC_DIR}" && env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+    -u GH_TOKEN -u CI_SERVER_HOST -u JIRA_API_URL -u FULLSEND_TRACKER -u FULLSEND_FORGE -u FULLSEND_WORK_ITEM_SOURCE \
+    "${pt_case#*|}" ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" JIRA_TOKEN="   " \
+    FULLSEND_DIR="${TMPDIR}/dot-fullsend" \
+    python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${PT_OIDC_DIR}/broker.log" "${PT_OIDC_DIR}/broker-answers" -- \
+    bash "${POST_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+  if [[ "${pt_rc}" -eq 1 ]] && grep -qF "Jira updates in oidc mode need fullsend core support" "${TMPDIR}/stdout.log" \
+    && ! grep -qF "not more than one" "${TMPDIR}/stdout.log" \
+    && [[ ! -s "${JIRA_CURL_LOG}" && ! -s "${GH_LOG}" ]]; then
+    echo "PASS: jira-oidc-post-triage-${pt_name}-whitespace-token-oidc-error"
+  else
+    echo "FAIL: jira-oidc-post-triage-${pt_name}-whitespace-token-oidc-error — rc=${pt_rc}"
+    cat "${TMPDIR}/stdout.log"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
 
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then

@@ -39,7 +39,7 @@ build_mock() {
   # Mock gh: `gh pr list` prints MOCK_GH_PRS (default: no PRs).
   cat > "${mock_bin}/gh" <<'GHEOF'
 #!/usr/bin/env bash
-echo "gh var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+echo "gh var=$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 if [[ "$1 $2" == "pr list" ]]; then
   [[ "${MOCK_GH_FAIL:-}" == "1" ]] && exit 1
   printf '%s\n' "${MOCK_GH_PRS:-[]}"
@@ -122,7 +122,7 @@ FSEOF
   # real jq.
   cat > "${mock_bin}/jq" <<'JQEOF'
 #!/usr/bin/env bash
-echo "jq var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+echo "jq var=$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 exec "${REAL_JQ}" "$@"
 JQEOF
   chmod +x "${mock_bin}/jq"
@@ -130,7 +130,7 @@ JQEOF
   # Mock git (needed for pre-commit tool resolution)
   cat > "${mock_bin}/git" <<'GITEOF'
 #!/usr/bin/env bash
-echo "git var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+echo "git var=$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 exit 1
 GITEOF
   chmod +x "${mock_bin}/git"
@@ -138,7 +138,7 @@ GITEOF
   # Mock python3 (needed for resolve-precommit-tools.py)
   cat > "${mock_bin}/python3" <<'PYEOF'
 #!/usr/bin/env bash
-echo "python3 var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+echo "python3 var=$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
 # MOCK_PY_MANIFEST: print it as the resolved tool manifest.
 if [[ -n "${MOCK_PY_MANIFEST:-}" ]]; then
   printf '%s\n' "${MOCK_PY_MANIFEST}"
@@ -662,7 +662,7 @@ mkdir -p "${OIDC_WS}/scripts" "${OIDC_WS}/target-repo"
 : > "${OIDC_WS}/scripts/resolve-precommit-tools.py"
 cat > "${OIDC_WS}/scripts/install-precommit-tools.sh" <<'INSTEOF'
 #!/usr/bin/env bash
-echo "install var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG}"
+echo "install var=$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG}"
 INSTEOF
 printf 'repos: []\n' > "${OIDC_WS}/target-repo/.pre-commit-config.yaml"
 RUN_BROKER="ok ${OIDC_TOKEN_VALUE}" run_skip_test "oidc-run-proceeds" \

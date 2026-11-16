@@ -41,9 +41,9 @@ set -euo pipefail
 
 # The Jira token broker fd (FULLSEND_JIRA_OIDC_TOKEN_FD, tracker.jira.auth:
 # oidc) is only for the Jira calls below. Every child runs without it except
-# the runner utilities the Jira helpers start while a call is in progress
-# (tr, mktemp, sed, tail, rm, cat) and the curl and fullsend
-# calls themselves: helpers that only run in a command substitution close it
+# the fullsend CLI and the runner utilities the Jira helpers start while a
+# call is in progress (tr, mktemp, sed, tail, rm, cat); curl runs without
+# it too. Helpers that only run in a command substitution close it
 # first, other commands go through _jira_no_broker, and it is closed for
 # good once the last Jira call is done, before any target-repo access.
 _jira_close_broker() {

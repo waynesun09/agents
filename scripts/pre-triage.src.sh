@@ -15,6 +15,27 @@
 
 set -euo pipefail
 
+# Triage has no Jira oidc support yet. Refuse oidc mode (a token broker fd,
+# or tracker.jira.auth: oidc in the config) on a Jira run before any label
+# change. An fd is closed and its variable unset first in any case.
+_jira_triage_oidc=""
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  [[ -n "${_jira_broker_fd}" ]] && _jira_triage_oidc=1
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
+fi
+if [[ "${FULLSEND_WORK_ITEM_SOURCE:-}" == "jira" || "${FULLSEND_TRACKER:-${FULLSEND_FORGE:-}}" == "jira" ]]; then
+  if [[ -n "${_jira_triage_oidc}" ]] || { [[ -n "${FULLSEND_DIR:-}" ]] \
+    && grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; }; then
+    echo "ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made" >&2
+    exit 1
+  fi
+fi
+unset _jira_triage_oidc
+
 : "${ISSUE_URL:?ISSUE_URL must be set}"
 FULLSEND_TRACKER="${FULLSEND_TRACKER:-${FULLSEND_FORGE:-}}"
 : "${FULLSEND_TRACKER:?FULLSEND_TRACKER must be set}"

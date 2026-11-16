@@ -16,6 +16,27 @@
 
 set -euo pipefail
 
+# Triage has no Jira oidc support yet. Refuse oidc mode (a token broker fd,
+# or tracker.jira.auth: oidc in the config) on a Jira run before any label
+# change. An fd is closed and its variable unset first in any case.
+_jira_triage_oidc=""
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  [[ -n "${_jira_broker_fd}" ]] && _jira_triage_oidc=1
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
+fi
+if [[ "${FULLSEND_WORK_ITEM_SOURCE:-}" == "jira" || "${FULLSEND_TRACKER:-${FULLSEND_FORGE:-}}" == "jira" ]]; then
+  if [[ -n "${_jira_triage_oidc}" ]] || { [[ -n "${FULLSEND_DIR:-}" ]] \
+    && grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; }; then
+    echo "ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made" >&2
+    exit 1
+  fi
+fi
+unset _jira_triage_oidc
+
 : "${ISSUE_URL:?ISSUE_URL must be set}"
 FULLSEND_TRACKER="${FULLSEND_TRACKER:-${FULLSEND_FORGE:-}}"
 : "${FULLSEND_TRACKER:?FULLSEND_TRACKER must be set}"
@@ -665,7 +686,7 @@ tracker_dispatch_triage() {
 #                     (tracker.jira.auth: oidc); asked on each call, and
 #                     the token sent only to JIRA_API_URL, a self-hosted
 #                     Jira gateway. Alone, never with the above. Used by
-#                     pre-triage and pre-code-jira; post-triage closes it.
+#                     pre-code-jira; triage does not support oidc mode yet.
 #   JIRA_USER_EMAIL — (optional) bot-user email (the triage harness maps
 #                     FULLSEND_JIRA_EMAIL to it). When set, requests use
 #                     Basic auth with email and token; when unset or
@@ -974,8 +995,7 @@ _jira_auth_oidc_fd_open() {
 # (git and its hooks, pre-commit and its installs, gitleaks, gh) must not
 # hold the fd, so call this before starting them; to keep the fd for later
 # Jira calls, call it in a subshell: ( jira_auth_drop_oidc_fd; gh ... ).
-# The close goes through eval because bash before 4.1 has no {var}<&- form
-# for a fd number held in a variable. A no-op when no fd is set.
+# A no-op when no fd is set.
 jira_auth_drop_oidc_fd() {
   local fd
   for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
@@ -994,10 +1014,17 @@ jira_auth_drop_oidc_fd() {
 # stream is out of step. Close the fd and fail. read -t 0 needs bash 4 or
 # later; jira_auth_select refuses the broker fd on an older bash.
 _jira_auth_oidc_check_pending() {
-  local fd="${_JIRA_AUTH_OIDC_FD}"
+  local fd="${_JIRA_AUTH_OIDC_FD}" byte="" rc=0
   if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    # Readable with nothing to read is end of file: the broker closed.
+    IFS= read -r -n 1 -t 1 byte <&"${fd}" 2>/dev/null || rc=$?
     jira_auth_drop_oidc_fd
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    if [[ "${rc}" -eq 1 && -z "${byte}" ]]; then
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
+    else
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    fi
+    byte=""
     return 1
   fi
 }
@@ -1026,6 +1053,7 @@ _jira_auth_oidc_fetch() {
     return 1
   fi
   if (( rc != 0 )); then
+    jira_auth_drop_oidc_fd
     if [[ -z "${line}" ]]; then
       echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
     else

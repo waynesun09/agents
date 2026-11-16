@@ -3679,7 +3679,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/git"
 # gitleaks stand-in that also records whether it holds the broker fd.
 cat > "${JIRA_INT_MOCK_BIN}/gitleaks" <<MOCKEOF
 #!/usr/bin/env bash
-echo "gitleaks var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "gitleaks var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) stage=\$([ -n "\${FULLSEND_JIRA_STAGE_RESULT+x}" ] && echo set || echo unset) fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 if [ "\${1:-}" = version ]; then echo 8.30.1; fi
 exit 0
 MOCKEOF
@@ -3689,13 +3689,13 @@ chmod +x "${JIRA_INT_MOCK_BIN}/gitleaks"
 cat > "${JIRA_INT_MOCK_BIN}/gh" <<MOCKEOF
 #!/usr/bin/env bash
 echo "gh \$*" >> "${JIRA_INT_FORGE_LOG}"
-echo "gh var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "gh var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) stage=\$([ -n "\${FULLSEND_JIRA_STAGE_RESULT+x}" ] && echo set || echo unset) fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 case "\$1 \$2" in
   "api -X")      echo "unexpected Git Data API call: \$*" >&2; exit 99 ;;
   "api repos/"*) echo "main"; exit 0 ;;
   "pr list")     if [[ -n "\${MOCK_EXISTING_PR:-}" ]]; then echo "7"; fi; exit 0 ;;
   "pr view")     echo "https://github.com/test-org/test-repo/pull/7"; exit 0 ;;
-  "pr create")   echo "https://github.com/test-org/test-repo/pull/1"; exit 0 ;;
+  "pr create")   printf '%s\n' "\${MOCK_PR_URL:-https://github.com/test-org/test-repo/pull/1}"; exit 0 ;;
   *)             exit 0 ;;
 esac
 MOCKEOF
@@ -3760,7 +3760,7 @@ if [[ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
     broker="answered-\${reply%% *}"
   fi
 fi
-echo "fullsend var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "fullsend var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) stage=\$([ -n "\${FULLSEND_JIRA_STAGE_RESULT+x}" ] && echo set || echo unset) fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 echo "fullsend \$* env-token=\${FULLSEND_JIRA_TOKEN:-unset} env-email=\${FULLSEND_JIRA_EMAIL-unset} env-client-id=\${FULLSEND_JIRA_CLIENT_ID-unset} env-client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} broker-var-present=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set} broker=\${broker} <<BODY:\${BODY}:BODY>>" >> "${JIRA_INT_FULLSEND_LOG}"
 if [[ -n "\${MOCK_FULLSEND_FAIL:-}" ]]; then
   echo "Error: Jira API returned 401" >&2
@@ -3774,7 +3774,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/fullsend"
 cat > "${JIRA_INT_MOCK_BIN}/pre-commit" <<MOCKEOF
 #!/usr/bin/env bash
 echo "pre-commit jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set}" >> "${JIRA_INT_PRECOMMIT_LOG}"
-echo "pre-commit var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "pre-commit var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) stage=\$([ -n "\${FULLSEND_JIRA_STAGE_RESULT+x}" ] && echo set || echo unset) fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 exit 0
 MOCKEOF
 chmod +x "${JIRA_INT_MOCK_BIN}/pre-commit"
@@ -3831,7 +3831,7 @@ for pid in "\${PPID}" "\${gp}"; do
   fi
 done
 echo "${hook_name} jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} proc-environ-leak=\${leak} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FD:+set}" >> "${log_path}"
-echo "${hook_name} var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} stage=\${FULLSEND_JIRA_STAGE_RESULT-unset} fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
+echo "${hook_name} var=\$([ -n "\${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset) stage=\$([ -n "\${FULLSEND_JIRA_STAGE_RESULT+x}" ] && echo set || echo unset) fds=\$(for f in /proc/self/fd/*; do readlink "\$f"; done 2>/dev/null | tr '\\n' ' ')" >> "${JIRA_INT_FD_LOG}"
 exit 0
 HOOKEOF
   chmod +x "${hook_path}"
@@ -4252,6 +4252,64 @@ for _jo_case in "broker-fd" "config"; do
     jira_int_fail "jira-oidc-no-result-${_jo_case}-fails" "missing oidc message, or a write was attempted"
   else
     echo "PASS: jira-oidc-no-result-${_jo_case}-fails (expected failure, got exit ${JIRA_INT_RC})"
+  fi
+done
+
+# A token broker fd next to a static Jira credential (JIRA_TOKEN,
+# FULLSEND_JIRA_TOKEN or the client pair) is refused before any git, forge
+# or Jira work, also when fullsend posts the stage comment. A value that is
+# only whitespace does not count.
+for _jc_case in "jira-token|JIRA_TOKEN=fake-jira-token FULLSEND_JIRA_TOKEN=" \
+  "fullsend-token|JIRA_TOKEN= FULLSEND_JIRA_TOKEN=fake-jira-token" \
+  "client-pair|JIRA_TOKEN= FULLSEND_JIRA_TOKEN= FULLSEND_JIRA_CLIENT_ID=client-id-1 FULLSEND_JIRA_CLIENT_SECRET=client-secret-1"; do
+  _jc_name="${_jc_case%%|*}"
+  read -r -a _jc_env <<< "${_jc_case#*|}"
+  for _jc_mode in fallback result; do
+    : > "${JIRA_INT_PREPUSH_LOG}"
+    if [ "${_jc_mode}" = "result" ]; then
+      JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" JIRA_INT_PREPUSH_HOOK="${JIRA_INT_PREPUSH_LOG}" \
+        run_jira_result "jira-oidc-conflict-${_jc_name}-${_jc_mode}" github "${_jc_env[@]}"
+    else
+      JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" JIRA_INT_PREPUSH_HOOK="${JIRA_INT_PREPUSH_LOG}" \
+        run_jira_int "jira-oidc-conflict-${_jc_name}-${_jc_mode}" github "${_jc_env[@]}"
+    fi
+    if [ "${JIRA_INT_RC}" -ne 1 ]; then
+      jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "expected exit 1"
+    elif ! grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" "${JIRA_INT_OUT}" \
+         || [ -s "${JIRA_INT_PREPUSH_LOG}" ] || [ -s "${JIRA_INT_FORGE_LOG}" ] || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
+      jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "missing conflict error, or a push, forge or Jira call happened"
+    elif [ "${_jc_mode}" = "result" ] && [ -s "${JIRA_RESULT_FILE}" ]; then
+      jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "a stage result was written"
+    elif grep -qF -e "fake-jira-token" -e "client-secret-1" "${JIRA_INT_OUT}"; then
+      jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "a credential value was printed"
+    else
+      echo "PASS: jira-oidc-conflict-${_jc_name}-${_jc_mode}-fails-before-push"
+    fi
+  done
+done
+
+# A whitespace-only token next to the broker fd is no conflict.
+JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" \
+  run_jira_result "jira-oidc-whitespace-token" github "JIRA_TOKEN=   " FULLSEND_JIRA_TOKEN=
+if [ "${JIRA_INT_RC}" -ne 0 ] || [ ! -s "${JIRA_RESULT_FILE}" ]; then
+  jira_int_fail "jira-oidc-whitespace-token-no-conflict" "post-code failed or wrote no result"
+else
+  echo "PASS: jira-oidc-whitespace-token-no-conflict"
+fi
+
+# A PR URL with a quote, a newline or a non-ASCII host is not written to the
+# stage result: the step fails and the file stays empty.
+for _ju_case in quote newline non-ascii; do
+  case "${_ju_case}" in
+    quote) _ju_url='https://github.com/test-org/test-repo/pull/1"x' ;;
+    newline) _ju_url=$'https://github.com/test-org/test-repo/pull/1\nhttps://github.com/test-org/test-repo/pull/2' ;;
+    non-ascii) _ju_url='https://gïthub.com/test-org/test-repo/pull/1' ;;
+  esac
+  run_jira_result "jira-stage-result-bad-url-${_ju_case}" github "MOCK_PR_URL=${_ju_url}"
+  if [ "${JIRA_INT_RC}" -ne 1 ] || [ -s "${JIRA_RESULT_FILE}" ]; then
+    jira_int_fail "jira-stage-result-bad-url-${_ju_case}" "expected exit 1 and an empty result file"
+  else
+    echo "PASS: jira-stage-result-bad-url-${_ju_case}-not-written"
   fi
 done
 

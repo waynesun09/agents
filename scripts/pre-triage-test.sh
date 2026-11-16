@@ -503,6 +503,43 @@ unset GITHUB_SERVER_URL GH_TOKEN
 
 # --- Summary ---
 
+# --- oidc mode: triage has no Jira oidc support yet ---
+# pre-triage refuses oidc mode before any label change: tracker.jira.auth:
+# oidc in the config, or a token broker fd. No Jira call (curl), no CLI
+# call, labels untouched, and the broker is never asked.
+PT_FS_LOG="${TMPDIR}/fullsend-calls.log"
+printf '#!/usr/bin/env bash\necho called >> %s\n' "${PT_FS_LOG}" > "${MOCK_BIN}/fullsend"
+chmod +x "${MOCK_BIN}/fullsend"
+PT_OIDC_FS_DIR="${TMPDIR}/dot-fullsend-oidc"
+mkdir -p "${PT_OIDC_FS_DIR}"
+printf 'tracker:\n  jira:\n    base_url: https://test.atlassian.net\n    auth: oidc\n' > "${PT_OIDC_FS_DIR}/config.yaml"
+printf 'ok test-header.test-payload.pre-triage-unused\n' > "${TMPDIR}/broker-answers"
+for pt_case in config broker-fd; do
+  : > "${CURL_LOG}"
+  : > "${PT_FS_LOG}"
+  rm -f "${TMPDIR}/broker.log"
+  pt_rc=0
+  if [[ "${pt_case}" == "config" ]]; then
+    (ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira FULLSEND_DIR="${PT_OIDC_FS_DIR}" \
+      PATH="${MOCK_BIN}:${PATH}" bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+  else
+    (ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira PATH="${MOCK_BIN}:${PATH}" \
+      python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${TMPDIR}/broker.log" "${TMPDIR}/broker-answers" -- \
+      bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+  fi
+  if [[ "${pt_rc}" -eq 1 ]] \
+    && grep -qxF "ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made" "${TMPDIR}/stdout.log" \
+    && [[ ! -s "${CURL_LOG}" && ! -s "${PT_FS_LOG}" ]] \
+    && ! grep -q '^request ' "${TMPDIR}/broker.log" 2>/dev/null; then
+    echo "PASS: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes"
+  else
+    echo "FAIL: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes — rc=${pt_rc}"
+    grep '^ERROR' "${TMPDIR}/stdout.log" || true
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+rm -f "${MOCK_BIN}/fullsend"
+
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then
   echo "${FAILURES} test(s) failed"

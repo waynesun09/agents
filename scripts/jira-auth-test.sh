@@ -139,7 +139,7 @@ if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
     broker="answered-${reply%% *}"
   fi
 fi
-printf 'oidc-fd=%s broker=%s oidc-token=%s\n' "${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" \
+printf 'oidc-fd=%s broker=%s oidc-token=%s\n' "$([ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ] && echo set || echo unset)" \
   "${broker}" "${FULLSEND_JIRA_OIDC_TOKEN:+set}" \
   >> "${LOG_DIR}/fullsend-oidc.log"
 MOCKEOF
@@ -613,7 +613,7 @@ else
   fail "oidc-token-not-kept-in-shell-variables" "a shell variable still holds an OIDC token"
 fi
 if grep -qx "token=unset email=unset id=unset secret=unset" "${CASE_DIR}/fullsend-env.log" \
-  && grep -qE "^oidc-fd=[0-9]+ broker=answered-ok oidc-token=$" "${CASE_DIR}/fullsend-oidc.log"; then
+  && grep -qE "^oidc-fd=set broker=answered-ok oidc-token=$" "${CASE_DIR}/fullsend-oidc.log"; then
   pass "oidc-fullsend-inherits-broker-fd-only"
 else
   fail "oidc-fullsend-inherits-broker-fd-only" "$(cat "${CASE_DIR}/fullsend-env.log" "${CASE_DIR}/fullsend-oidc.log" 2>/dev/null)"
@@ -661,12 +661,12 @@ fi
 CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-drop '
   export JIRA_API_URL="${TEST_GATEWAY}"
   jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
-  ( jira_auth_drop_oidc_fd; bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo child-fd=open || echo child-fd=closed; echo child-var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" )
+  ( jira_auth_drop_oidc_fd; bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo child-fd=open || echo child-fd=closed; echo child-var=\${FULLSEND_JIRA_OIDC_TOKEN_FD+set}" )
   bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo parent-fd=open || echo parent-fd=closed"
   jira_auth_drop_oidc_fd
   if jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself"; then echo after=ok; else echo after=refused; fi
 '
-if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "child-fd=closed" "${CASE_OUT}" && grep -qx "child-var=unset" "${CASE_OUT}" \
+if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "child-fd=closed" "${CASE_OUT}" && grep -qx "child-var=" "${CASE_OUT}" \
   && grep -qx "parent-fd=open" "${CASE_OUT}" && grep -qx "after=refused" "${CASE_OUT}" \
   && grep -qF "token broker is not open" "${CASE_ERR}" && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
   pass "oidc-drop-closes-fd-and-unsets-variable"
@@ -721,6 +721,7 @@ done
 for bcase in "err|err fetch_failed|could not supply a token (err fetch_failed)" \
   "timeout|hang|did not answer within 1s" \
   "closed|close|token broker closed" \
+  "partial|partial ok abc-DO-NOT-LEAK|sent an incomplete answer" \
   "unexpected|okay-DO-NOT-LEAK|sent an unexpected answer" \
   "bad-err|err Bad Code DO-NOT-LEAK|sent a malformed error" \
   "not-jwt|ok not-a-jwt-DO-NOT-LEAK|did not send a JWT" \
@@ -895,14 +896,31 @@ else
   fail "oidc-cli-refused-on-pending-data" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
 fi
 
+# A broker that answers and then closes: the next call finds end of file
+# waiting on the fd and reports the broker closed, without asking.
+CASE_BROKER="okclose ok ${OIDC_TOKEN}" run_case oidc-pending-eof '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" >/dev/null && echo first=ok
+  sleep 1
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" || echo second=refused
+'
+if grep -qx "first=ok" "${CASE_OUT}" && grep -qx "second=refused" "${CASE_OUT}" \
+  && grep -qF "token broker closed" "${CASE_ERR}" \
+  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 1 ]]; then
+  pass "oidc-pending-eof-reports-broker-closed"
+else
+  fail "oidc-pending-eof-reports-broker-closed" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
+
 # A broker fd value with surrounding whitespace is trimmed, as by
 # jira_auth_select, so jira_auth_drop_oidc_fd still closes it.
 CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-drop-trimmed '
   export FULLSEND_JIRA_OIDC_TOKEN_FD=" ${FULLSEND_JIRA_OIDC_TOKEN_FD} "
   jira_auth_drop_oidc_fd
-  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo fd=open || echo fd=closed; echo var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}"
+  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo fd=open || echo fd=closed; echo var=\${FULLSEND_JIRA_OIDC_TOKEN_FD+set}"
 '
-if grep -qx "fd=closed" "${CASE_OUT}" && grep -qx "var=unset" "${CASE_OUT}"; then
+if grep -qx "fd=closed" "${CASE_OUT}" && grep -qx "var=" "${CASE_OUT}"; then
   pass "oidc-drop-trims-fd-value"
 else
   fail "oidc-drop-trims-fd-value" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"

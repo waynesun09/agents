@@ -1766,11 +1766,50 @@ for scribe_case in "github-with-token" "jira-with-token" "jira-alone"; do
     echo "PASS: pre-scribe-oidc-fd-${scribe_case}-refused"
   else
     echo "FAIL: pre-scribe-oidc-fd-${scribe_case}-refused — rc=${scribe_rc}"
-    cat "${SCRIBE_OIDC_DIR}/out"
+    grep '^ERROR' "${SCRIBE_OIDC_DIR}/out" || true
     FAILURES=$((FAILURES + 1))
   fi
 done
 rm -rf "${SCRIBE_OIDC_DIR}"
+
+# On a GitHub-tracker run a token broker fd alone (next to a whitespace-only
+# token, which does not count) is closed first: no conflict, and gh, the
+# first forge child, holds neither the fd nor the variable.
+SCRIBE_PROBE_DIR="$(mktemp -d)"
+mkdir -p "${SCRIBE_PROBE_DIR}/bin" "${SCRIBE_PROBE_DIR}/runner"
+cat > "${SCRIBE_PROBE_DIR}/bin/gh" <<'PROBEEOF'
+#!/usr/bin/env bash
+fd=closed
+if [[ -n "${TEST_BROKER_FD:-}" ]] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null; then
+  fd=open
+fi
+var=unset
+[[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD+x}" ]] && var=set
+echo "gh fd=${fd} var=${var}" >> "${SCRIBE_PROBE_LOG}"
+echo "[]"
+exit 0
+PROBEEOF
+chmod +x "${SCRIBE_PROBE_DIR}/bin/gh"
+printf 'ok test-header.test-payload.scribe-unused\n' > "${SCRIBE_PROBE_DIR}/answers"
+: > "${SCRIBE_PROBE_DIR}/probe.log"
+env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+  FULLSEND_FORGE=github FULLSEND_TRACKER=github JIRA_TOKEN="   " GH_TOKEN=fake-gh-token \
+  SCRIBE_REPO=test-org/test-repo SCRIBE_DRY_RUN=true RUNNER_TEMP="${SCRIBE_PROBE_DIR}/runner" \
+  SCRIBE_SEARCH_QUERY=standup SCRIBE_LOOKBACK_HOURS=3 \
+  SCRIBE_PROBE_LOG="${SCRIBE_PROBE_DIR}/probe.log" PATH="${SCRIBE_PROBE_DIR}/bin:${PATH}" \
+  python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${SCRIBE_PROBE_DIR}/broker.log" \
+  "${SCRIBE_PROBE_DIR}/answers" -- bash "${PRE_SCRIPT}" > "${SCRIBE_PROBE_DIR}/out" 2>&1 || true
+if [[ -s "${SCRIBE_PROBE_DIR}/probe.log" ]] \
+  && [[ "$(sort -u "${SCRIBE_PROBE_DIR}/probe.log")" == "gh fd=closed var=unset" ]] \
+  && ! grep -qF "not more than one" "${SCRIBE_PROBE_DIR}/out"; then
+  echo "PASS: pre-scribe-oidc-fd-closed-for-gh"
+else
+  echo "FAIL: pre-scribe-oidc-fd-closed-for-gh"
+  grep '^ERROR' "${SCRIBE_PROBE_DIR}/out" || true
+  cat "${SCRIBE_PROBE_DIR}/probe.log"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "${SCRIBE_PROBE_DIR}"
 
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then

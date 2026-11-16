@@ -8,7 +8,8 @@ inherited and FULLSEND_JIRA_OIDC_TOKEN_FD set to its number. The other end
 is served in a thread: each request line is logged to LOG (the request,
 never a token), and answered with the next line of RESPONSES. Special
 response lines: "hang" sends nothing, "close" closes the broker end,
-"delay N LINE" sends LINE after N seconds.
+"delay N LINE" sends LINE after N seconds, "partial TEXT" sends TEXT with
+no newline and closes, "okclose LINE" sends LINE and closes.
 Lines are sent with a trailing newline. Exits with COMMAND's exit code.
 
 The first LOG line is "inode socket:[N]", the inode of the end the command
@@ -38,6 +39,14 @@ def serve(sock, log_path, responses):
             if response == "hang":
                 continue
             if response == "close":
+                sock.close()
+                return
+            if response.startswith("partial "):
+                sock.sendall(response[len("partial "):].encode("ascii"))
+                sock.close()
+                return
+            if response.startswith("okclose "):
+                sock.sendall(response[len("okclose "):].encode("ascii") + b"\n")
                 sock.close()
                 return
             if response.startswith("delay "):
