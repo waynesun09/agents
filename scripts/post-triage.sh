@@ -1439,7 +1439,7 @@ jira_auth_fullsend() {
 # END bundled: lib/jira-auth.lib.sh
 jira_auth_select "${JIRA_TOKEN:-}" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
 if [[ "${JIRA_AUTH_MODE}" == "none" ]]; then
-  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD" >&2
+  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET; if tracker.jira.auth is oidc, triage needs fullsend core support that is not available yet; no Jira changes were made" >&2
   exit 1
 fi
 # JIRA_API_URL is optional, but the credentials are sent to it, so refuse

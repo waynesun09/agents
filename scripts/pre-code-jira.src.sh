@@ -170,11 +170,10 @@ if (( _jira_creds_set )); then
   REPO="${PROJECT_KEY}"
   # shellcheck disable=SC2034
   JIRA_ISSUE_NUM="${ISSUE_KEY##*-}"
-elif [[ -n "${FULLSEND_DIR:-}" ]] \
-  && _jira_no_broker grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; then
-  echo "::notice::Jira oidc mode, but this fullsend core passed no token broker (FULLSEND_JIRA_OIDC_TOKEN_FD) — skipping child-issue check and skip comment"
 else
-  echo "No Jira credentials set — skipping child-issue check and skip comment"
+  # Without a broker fd, oidc mode looks like no credential at all, so the
+  # notice covers both causes.
+  echo "No Jira credentials set — skipping child-issue check and skip comment (in oidc mode, this fullsend core passed no token broker, FULLSEND_JIRA_OIDC_TOKEN_FD)"
 fi
 
 SKIP_COMMENT_MARKER="<!-- fullsend:pre-code-jira-skip -->"

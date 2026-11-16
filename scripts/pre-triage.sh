@@ -16,21 +16,37 @@
 
 set -euo pipefail
 
-# Triage has no Jira oidc support yet. Refuse oidc mode (a token broker fd,
-# or tracker.jira.auth: oidc in the config) on a Jira run before any label
-# change. An fd is closed and its variable unset first in any case.
+# Triage has no Jira oidc support yet. A token broker fd is closed and its
+# variable unset first. Next to a static Jira credential it is a conflict on
+# every tracker; on a Jira run it is refused before any label change.
+# Without one, oidc mode leaves no Jira credential, and the Jira library
+# refuses that (with a message covering oidc mode) before any label change
+# too. The config is not parsed here: a plain-text match on "auth: oidc"
+# would also hit other blocks, such as inference.gateway.auth.
 _jira_triage_oidc=""
 if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  # Keep the credential checks off the trace.
+  _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
   _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
   if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
     eval "exec $((10#${_jira_broker_fd}))<&-"
   fi
-  [[ -n "${_jira_broker_fd}" ]] && _jira_triage_oidc=1
-  unset FULLSEND_JIRA_OIDC_TOKEN_FD _jira_broker_fd
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  if [[ -n "${_jira_broker_fd}" ]]; then
+    _jira_triage_oidc=1
+    _jira_static="${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}"
+    _jira_static="${_jira_static//[[:space:]]/}"
+    if [[ -n "${_jira_static}" ]]; then
+      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" >&2
+      exit 1
+    fi
+  fi
+  unset _jira_broker_fd _jira_static
+  (( _jira_xtrace_was_on )) && set -x
+  unset _jira_xtrace_was_on
 fi
 if [[ "${FULLSEND_WORK_ITEM_SOURCE:-}" == "jira" || "${FULLSEND_TRACKER:-${FULLSEND_FORGE:-}}" == "jira" ]]; then
-  if [[ -n "${_jira_triage_oidc}" ]] || { [[ -n "${FULLSEND_DIR:-}" ]] \
-    && grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; }; then
+  if [[ -n "${_jira_triage_oidc}" ]]; then
     echo "ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made" >&2
     exit 1
   fi
@@ -1403,7 +1419,7 @@ jira_auth_fullsend() {
 # END bundled: lib/jira-auth.lib.sh
 jira_auth_select "${JIRA_TOKEN:-}" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
 if [[ "${JIRA_AUTH_MODE}" == "none" ]]; then
-  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD" >&2
+  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET; if tracker.jira.auth is oidc, triage needs fullsend core support that is not available yet; no Jira changes were made" >&2
   exit 1
 fi
 # JIRA_API_URL is optional, but the credentials are sent to it, so refuse

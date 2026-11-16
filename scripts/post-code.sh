@@ -95,7 +95,6 @@ set -euo pipefail
 # hook could read without that.
 # ---------------------------------------------------------------------------
 _jira_token_saved=""
-_jira_fullsend_token_saved=""
 _jira_email_saved=""
 _jira_client_id_saved=""
 _jira_client_secret_saved=""
@@ -108,15 +107,13 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
   unset _POST_CODE_JIRA_FD
   { IFS= read -r -d '' _jira_token_saved || true; IFS= read -r -d '' _jira_email_saved || true
     IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true
-    IFS= read -r -d '' _jira_oidc_seen || true; IFS= read -r -d '' _jira_stage_result_saved || true
-    IFS= read -r -d '' _jira_fullsend_token_saved || true; } \
+    IFS= read -r -d '' _jira_oidc_seen || true; IFS= read -r -d '' _jira_stage_result_saved || true; } \
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
   # Core posts the stage comment: no Jira credential is needed here at all.
   if [[ -n "${_jira_stage_result_saved}" ]]; then
     _jira_token_saved=""
-    _jira_fullsend_token_saved=""
     _jira_email_saved=""
     _jira_client_id_saved=""
     _jira_client_secret_saved=""
@@ -129,6 +126,9 @@ elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEN
   # forge or Jira work, also when fullsend posts the stage comment.
   if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
     _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+    if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+      eval "exec $((10#${_jira_broker_fd}))<&-"
+    fi
     if [[ -n "${_jira_broker_fd}" ]]; then
       _jira_oidc_seen=1
       _jira_static="${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}"
@@ -139,17 +139,14 @@ elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEN
       fi
       unset _jira_static
     fi
-    if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
-      eval "exec $((10#${_jira_broker_fd}))<&-"
-    fi
     unset _jira_broker_fd
   fi
   _jira_stash_file="$(mktemp)"
   exec {_jira_stash_fd}<>"${_jira_stash_file}"
   rm -f "${_jira_stash_file}"
-  printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
+  printf '%s\0%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
     "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" \
-    "${_jira_oidc_seen}" "${FULLSEND_JIRA_STAGE_RESULT-}" "${FULLSEND_JIRA_TOKEN-}" >&"${_jira_stash_fd}"
+    "${_jira_oidc_seen}" "${FULLSEND_JIRA_STAGE_RESULT-}" >&"${_jira_stash_fd}"
   exec env -u JIRA_TOKEN -u JIRA_USER_EMAIL -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL \
     -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
     -u FULLSEND_JIRA_OIDC_TOKEN_FD -u FULLSEND_JIRA_STAGE_RESULT \
@@ -3935,12 +3932,17 @@ forge_ensure_label() {
 # END bundled: lib/labels.lib.sh
 
 # Conflicting Jira credentials fail before any other work. Only the
-# fallback stage update (no FULLSEND_JIRA_STAGE_RESULT) uses them.
+# fallback stage update (no FULLSEND_JIRA_STAGE_RESULT) uses them. The
+# token is passed by value, so xtrace is off around the call.
 if [[ -z "${_jira_stage_result_saved}" ]] \
-  && [[ "${FULLSEND_TRACKER:-${FULLSEND_WORK_ITEM_SOURCE:-}}" == "jira" ]] \
-  && ! jira_auth_select "${_jira_token_saved:-}" _jira_client_id_saved _jira_client_secret_saved; then
-  gha_echo error "Conflicting Jira credentials; cannot write to Jira"
-  exit 1
+  && [[ "${FULLSEND_TRACKER:-${FULLSEND_WORK_ITEM_SOURCE:-}}" == "jira" ]]; then
+  _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
+  if ! jira_auth_select "${_jira_token_saved:-}" _jira_client_id_saved _jira_client_secret_saved; then
+    gha_echo error "Conflicting Jira credentials; cannot write to Jira"
+    exit 1
+  fi
+  (( _jira_xtrace_was_on )) && set -x
+  unset _jira_xtrace_was_on
 fi
 
 # ---------------------------------------------------------------------------
@@ -4390,7 +4392,23 @@ post_jira_stage_update() {
   # isolation"); they are passed to the trusted CLI below and nowhere else.
   # The email is optional: without it the CLI uses service-account Bearer
   # auth. Client credentials replace the token, and the CLI mints its own
-  # access token from them.
+  # access token from them. The token is passed by value, so xtrace stays
+  # off from here to the end of the write.
+  local xtrace_was_on=0 rc=0
+  if [[ $- == *x* ]]; then
+    xtrace_was_on=1
+    set +x
+  fi
+  _post_jira_stage_update_write "${verb}" "${pr_url}" "${project}" "${number}" || rc=$?
+  if [[ "${xtrace_was_on}" -eq 1 ]]; then
+    set -x
+  fi
+  return "${rc}"
+}
+
+# The credential part of post_jira_stage_update, called with xtrace off.
+_post_jira_stage_update_write() {
+  local verb="$1" pr_url="$2" project="$3" number="$4"
   if ! jira_auth_select "${_jira_token_saved:-}" \
     _jira_client_id_saved _jira_client_secret_saved; then
     gha_echo error "Conflicting Jira credentials; cannot write to Jira"
@@ -4398,13 +4416,13 @@ post_jira_stage_update() {
   fi
   if [ "${JIRA_AUTH_MODE}" = "none" ]; then
     # oidc mode needs fullsend to post the comment (FULLSEND_JIRA_STAGE_RESULT).
-    # A broker fd seen at the start, or tracker.jira.auth: oidc in the
-    # config, picks the clearer message; the config is read for that only.
-    if [ -n "${_jira_oidc_seen}" ] || { [ -n "${FULLSEND_DIR:-}" ] \
-      && grep -qE '^[[:space:]]+auth:[[:space:]]*["'"'"']?oidc["'"'"']?[[:space:]]*(#.*)?$' "${FULLSEND_DIR}/config.yaml" 2>/dev/null; }; then
+    # A broker fd seen at the start marks oidc mode. Without one, oidc mode
+    # looks like no credential at all (core passes no FULLSEND_JIRA_* then),
+    # so that message covers both causes.
+    if [ -n "${_jira_oidc_seen}" ]; then
       gha_echo error "this fullsend release cannot post the Jira stage comment in oidc mode; upgrade fullsend so it sets FULLSEND_JIRA_STAGE_RESULT"
     else
-      gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET)"
+      gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET); if tracker.jira.auth is oidc, this fullsend release cannot post the Jira stage comment: upgrade fullsend so it sets FULLSEND_JIRA_STAGE_RESULT"
     fi
     return 1
   fi

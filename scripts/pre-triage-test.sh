@@ -209,6 +209,85 @@ run_test "jira-api-url-non-https-fails" \
   "true" "true"
 unset JIRA_API_URL
 
+# --- oidc mode: triage has no Jira oidc support yet ---
+# A token broker fd is refused before any label change, and next to a
+# static Jira credential it is a conflict on every tracker (the gh and curl
+# mocks share the call log, so an empty log means no label call at all). Without one, oidc
+# mode leaves no Jira credential, which the Jira library refuses (with a
+# message that covers oidc mode) before any label change. The config is not
+# parsed: "auth: oidc" in another block, such as inference.gateway, does not
+# stop a run that has a static token. No Jira call (curl), no CLI call and
+# no broker request on the refused paths.
+PT_FS_LOG="${TMPDIR}/fullsend-calls.log"
+printf '#!/usr/bin/env bash\necho called >> %s\n' "${PT_FS_LOG}" > "${MOCK_BIN}/fullsend"
+chmod +x "${MOCK_BIN}/fullsend"
+PT_FLOW_DIR="${TMPDIR}/dot-fullsend-flow"
+PT_INFER_DIR="${TMPDIR}/dot-fullsend-inference"
+mkdir -p "${PT_FLOW_DIR}" "${PT_INFER_DIR}"
+printf 'tracker: {jira: {base_url: "https://test.atlassian.net", auth: oidc}}\n' > "${PT_FLOW_DIR}/config.yaml"
+printf 'inference:\n  gateway:\n    auth: oidc\ntracker:\n  jira:\n    base_url: https://test.atlassian.net\n' > "${PT_INFER_DIR}/config.yaml"
+printf 'ok test-header.test-payload.pre-triage-unused\n' > "${TMPDIR}/broker-answers"
+for pt_case in broker-fd flow-config-no-credential inference-oidc-with-token conflict-jira conflict-github; do
+  : > "${CURL_LOG}"
+  : > "${PT_FS_LOG}"
+  echo '[]' > "${MOCK_LABELS_FILE}"
+  rm -f "${TMPDIR}/broker.log"
+  pt_rc=0
+  case "${pt_case}" in
+    broker-fd)
+      (env -u JIRA_TOKEN ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira \
+        PATH="${MOCK_BIN}:${PATH}" \
+        python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${TMPDIR}/broker.log" "${TMPDIR}/broker-answers" -- \
+        bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+      want="ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made"
+      ;;
+    flow-config-no-credential)
+      (env -u JIRA_TOKEN -u FULLSEND_JIRA_TOKEN ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira \
+        FULLSEND_DIR="${PT_FLOW_DIR}" PATH="${MOCK_BIN}:${PATH}" bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+      want="ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET; if tracker.jira.auth is oidc, triage needs fullsend core support that is not available yet; no Jira changes were made"
+      ;;
+    conflict-jira | conflict-github)
+      if [[ "${pt_case}" == "conflict-jira" ]]; then
+        pt_tracker=jira
+        pt_url="https://test.atlassian.net/browse/TESTPROJ-42"
+      else
+        pt_tracker=github
+        pt_url="https://github.com/test-org/test-repo/issues/42"
+      fi
+      (ISSUE_URL="${pt_url}" FULLSEND_TRACKER="${pt_tracker}" JIRA_TOKEN=fake-jira-token GH_TOKEN=fake-gh-token \
+        PATH="${MOCK_BIN}:${PATH}" \
+        python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${TMPDIR}/broker.log" "${TMPDIR}/broker-answers" -- \
+        bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+      want="ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one"
+      ;;
+    inference-oidc-with-token)
+      (ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira JIRA_TOKEN=fake-jira-token \
+        FULLSEND_DIR="${PT_INFER_DIR}" PATH="${MOCK_BIN}:${PATH}" bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
+      want=""
+      ;;
+  esac
+  if [[ -n "${want}" ]]; then
+    if [[ "${pt_rc}" -eq 1 ]] && grep -qxF "${want}" "${TMPDIR}/stdout.log" \
+      && [[ ! -s "${CURL_LOG}" && ! -s "${PT_FS_LOG}" ]] \
+      && ! grep -qF "fake-jira-token" "${TMPDIR}/stdout.log" \
+      && ! grep -q '^request ' "${TMPDIR}/broker.log" 2>/dev/null; then
+      echo "PASS: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes"
+    else
+      echo "FAIL: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes — rc=${pt_rc}"
+      grep '^ERROR' "${TMPDIR}/stdout.log" || true
+      FAILURES=$((FAILURES + 1))
+    fi
+  elif [[ "${pt_rc}" -eq 0 ]] && grep -qF "/rest/api/3/issue/TESTPROJ-42" "${CURL_LOG}" \
+    && grep -qF "Label reset complete." "${TMPDIR}/stdout.log"; then
+    echo "PASS: jira-pre-triage-${pt_case}-strips-labels-normally"
+  else
+    echo "FAIL: jira-pre-triage-${pt_case}-strips-labels-normally — rc=${pt_rc}"
+    grep '^ERROR' "${TMPDIR}/stdout.log" || true
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+rm -f "${MOCK_BIN}/fullsend"
+
 # --- Jira credential guard tests (#876, #1900) ---
 # Verify that the source-time :? guard on JIRA_TOKEN rejects unset and empty
 # values before any API call is made. JIRA_USER_EMAIL is optional: with it
@@ -502,43 +581,6 @@ run_test "github-non-https-server-url-fails" \
 unset GITHUB_SERVER_URL GH_TOKEN
 
 # --- Summary ---
-
-# --- oidc mode: triage has no Jira oidc support yet ---
-# pre-triage refuses oidc mode before any label change: tracker.jira.auth:
-# oidc in the config, or a token broker fd. No Jira call (curl), no CLI
-# call, labels untouched, and the broker is never asked.
-PT_FS_LOG="${TMPDIR}/fullsend-calls.log"
-printf '#!/usr/bin/env bash\necho called >> %s\n' "${PT_FS_LOG}" > "${MOCK_BIN}/fullsend"
-chmod +x "${MOCK_BIN}/fullsend"
-PT_OIDC_FS_DIR="${TMPDIR}/dot-fullsend-oidc"
-mkdir -p "${PT_OIDC_FS_DIR}"
-printf 'tracker:\n  jira:\n    base_url: https://test.atlassian.net\n    auth: oidc\n' > "${PT_OIDC_FS_DIR}/config.yaml"
-printf 'ok test-header.test-payload.pre-triage-unused\n' > "${TMPDIR}/broker-answers"
-for pt_case in config broker-fd; do
-  : > "${CURL_LOG}"
-  : > "${PT_FS_LOG}"
-  rm -f "${TMPDIR}/broker.log"
-  pt_rc=0
-  if [[ "${pt_case}" == "config" ]]; then
-    (ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira FULLSEND_DIR="${PT_OIDC_FS_DIR}" \
-      PATH="${MOCK_BIN}:${PATH}" bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
-  else
-    (ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" FULLSEND_TRACKER=jira PATH="${MOCK_BIN}:${PATH}" \
-      python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${TMPDIR}/broker.log" "${TMPDIR}/broker-answers" -- \
-      bash "${PRE_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_rc=$?
-  fi
-  if [[ "${pt_rc}" -eq 1 ]] \
-    && grep -qxF "ERROR: pre-triage: Jira triage in oidc mode needs fullsend core support that is not available yet; no Jira changes were made" "${TMPDIR}/stdout.log" \
-    && [[ ! -s "${CURL_LOG}" && ! -s "${PT_FS_LOG}" ]] \
-    && ! grep -q '^request ' "${TMPDIR}/broker.log" 2>/dev/null; then
-    echo "PASS: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes"
-  else
-    echo "FAIL: jira-oidc-pre-triage-${pt_case}-refused-before-label-changes — rc=${pt_rc}"
-    grep '^ERROR' "${TMPDIR}/stdout.log" || true
-    FAILURES=$((FAILURES + 1))
-  fi
-done
-rm -f "${MOCK_BIN}/fullsend"
 
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then

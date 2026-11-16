@@ -685,21 +685,13 @@ else
 fi
 rm -rf "${OIDC_WS}/scripts" "${OIDC_WS}/target-repo"
 
-# oidc mode without a broker fd (a core that passes none): a notice, not
-# "No Jira credentials set", and the run proceeds.
-mkdir -p "${TMPDIR}/fullsend-dir"
-printf 'tracker:\n  jira:\n    base_url: https://acme.atlassian.net\n    auth: oidc\n' > "${TMPDIR}/fullsend-dir/config.yaml"
+# oidc mode without a broker fd (a core that passes none) looks like no
+# credential at all: one notice that covers both causes, and the run
+# proceeds.
 run_skip_test "oidc-without-broker-fd-logs-notice" \
   false \
-  "this fullsend core passed no token broker (FULLSEND_JIRA_OIDC_TOKEN_FD)" \
+  "No Jira credentials set — skipping child-issue check and skip comment (in oidc mode, this fullsend core passed no token broker, FULLSEND_JIRA_OIDC_TOKEN_FD)" \
   "JIRA_TOKEN="
-if grep -qF "No Jira credentials set" "${TMPDIR}/stdout.log"; then
-  echo "FAIL: oidc-without-broker-fd-no-generic-message — the generic no-credentials message was logged"
-  FAILURES=$((FAILURES + 1))
-else
-  echo "PASS: oidc-without-broker-fd-no-generic-message"
-fi
-rm -f "${TMPDIR}/fullsend-dir/config.yaml"
 
 # --- Summary ---
 

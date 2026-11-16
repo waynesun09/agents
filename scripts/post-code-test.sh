@@ -4232,8 +4232,10 @@ else
 fi
 
 # oidc mode on a core that does not set the result variable cannot post the
-# comment: post-code fails with a clear message and calls no CLI. The mode
-# is recognised from a broker fd, or from tracker.jira.auth: oidc.
+# comment: post-code fails with a clear message and calls no CLI. A broker
+# fd marks oidc mode; without one (here, an oidc config and no credential)
+# it looks like no credential, and the message covers both causes. The
+# config is not parsed.
 JIRA_OIDC_CONFIG_DIR="${JIRA_INT_TMPDIR}/dot-fullsend-oidc"
 mkdir -p "${JIRA_OIDC_CONFIG_DIR}"
 printf 'tracker:\n  jira:\n    base_url: https://test.atlassian.net\n    auth: oidc\n' > "${JIRA_OIDC_CONFIG_DIR}/config.yaml"
@@ -4247,7 +4249,7 @@ for _jo_case in "broker-fd" "config"; do
   fi
   if [ "${JIRA_INT_RC}" -eq 0 ]; then
     jira_int_fail "jira-oidc-no-result-${_jo_case}-fails" "expected failure but got success"
-  elif ! grep -qF "this fullsend release cannot post the Jira stage comment in oidc mode" "${JIRA_INT_OUT}" \
+  elif ! grep -qF "this fullsend release cannot post the Jira stage comment" "${JIRA_INT_OUT}" \
        || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
     jira_int_fail "jira-oidc-no-result-${_jo_case}-fails" "missing oidc message, or a write was attempted"
   else
@@ -4281,7 +4283,8 @@ for _jc_case in "jira-token|JIRA_TOKEN=fake-jira-token FULLSEND_JIRA_TOKEN=" \
     elif [ "${_jc_mode}" = "result" ] && [ -s "${JIRA_RESULT_FILE}" ]; then
       jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "a stage result was written"
     elif grep -qF -e "fake-jira-token" -e "client-secret-1" "${JIRA_INT_OUT}"; then
-      jira_int_fail "jira-oidc-conflict-${_jc_name}-${_jc_mode}" "a credential value was printed"
+      echo "FAIL: jira-oidc-conflict-${_jc_name}-${_jc_mode} — a credential value was printed (output not printed)"
+      FAILURES=$((FAILURES + 1))
     else
       echo "PASS: jira-oidc-conflict-${_jc_name}-${_jc_mode}-fails-before-push"
     fi
@@ -4312,6 +4315,46 @@ for _ju_case in quote newline non-ascii; do
     echo "PASS: jira-stage-result-bad-url-${_ju_case}-not-written"
   fi
 done
+
+# "auth: oidc" in another config block (inference.gateway) does not affect
+# the Jira stage update: with a static token it takes the normal path.
+JIRA_INFER_CONFIG_DIR="${JIRA_INT_TMPDIR}/dot-fullsend-inference"
+mkdir -p "${JIRA_INFER_CONFIG_DIR}"
+printf 'inference:\n  gateway:\n    auth: oidc\ntracker:\n  jira:\n    base_url: https://test.atlassian.net\n' \
+  > "${JIRA_INFER_CONFIG_DIR}/config.yaml"
+run_jira_int "jira-inference-oidc-config-with-token" github "FULLSEND_DIR=${JIRA_INFER_CONFIG_DIR}"
+if [ "${JIRA_INT_RC}" -ne 0 ] || ! grep -qF -- "${JIRA_CODE_MARKER}" "${JIRA_INT_FULLSEND_LOG}"; then
+  jira_int_fail "jira-inference-oidc-config-with-token-normal-path" "the stage update did not take the normal path"
+else
+  echo "PASS: jira-inference-oidc-config-with-token-normal-path"
+fi
+
+# Under xtrace (SHELLOPTS, so the re-exec traces too) no Jira token value
+# reaches the output: neither on the fallback write nor when a broker fd
+# next to the token is refused.
+JIRA_XTRACE_TOKEN="xtrace-jira-token-DO-NOT-LEAK"
+JIRA_INT_XTRACE=1 run_jira_int "jira-token-xtrace" github \
+  "JIRA_TOKEN=${JIRA_XTRACE_TOKEN}" "FULLSEND_JIRA_TOKEN=${JIRA_XTRACE_TOKEN}"
+if [ "${JIRA_INT_RC}" -ne 0 ] || ! grep -q '^+' "${JIRA_INT_OUT}" \
+   || ! grep -qF -- "${JIRA_CODE_MARKER}" "${JIRA_INT_FULLSEND_LOG}"; then
+  jira_int_fail "jira-token-xtrace-not-traced" "post-code failed, or no trace output"
+elif grep -qF "${JIRA_XTRACE_TOKEN}" "${JIRA_INT_OUT}"; then
+  echo "FAIL: jira-token-xtrace-not-traced — the token appears in the traced output (output not printed)"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: jira-token-xtrace-not-traced"
+fi
+JIRA_INT_XTRACE=1 JIRA_INT_BROKER="ok test-header.test-payload.post-code-unused" \
+  run_jira_int "jira-oidc-conflict-xtrace" github \
+  "JIRA_TOKEN=${JIRA_XTRACE_TOKEN}" "FULLSEND_JIRA_TOKEN=${JIRA_XTRACE_TOKEN}"
+if [ "${JIRA_INT_RC}" -ne 1 ] || ! grep -qF "not more than one" "${JIRA_INT_OUT}"; then
+  jira_int_fail "jira-oidc-conflict-xtrace-not-traced" "expected the conflict error"
+elif grep -qF "${JIRA_XTRACE_TOKEN}" "${JIRA_INT_OUT}"; then
+  echo "FAIL: jira-oidc-conflict-xtrace-not-traced — the token appears in the traced output (output not printed)"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "PASS: jira-oidc-conflict-xtrace-not-traced"
+fi
 
 # The config-backed CLI needs FULLSEND_DIR for tracker.jira.
 run_jira_int "jira-missing-fullsend-dir" github FULLSEND_DIR=
