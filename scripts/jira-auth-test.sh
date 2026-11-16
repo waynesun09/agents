@@ -3,7 +3,7 @@
 #
 # Covers the five credential cases: token + email (Basic), token only
 # (Bearer), OAuth 2.0 client credentials (minted Bearer token, fake curl and
-# fake fullsend on PATH), the CI OIDC token file whose token is sent to a
+# fake fullsend on PATH), CI OIDC tokens from an fd broker sent to a
 # self-hosted gateway, and conflicting settings. In client-credentials
 # mode, asserts the client secret is in no curl or fullsend argv and in no
 # stdout or stderr; in OIDC mode, the same for the OIDC token.
@@ -21,7 +21,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Tests set exactly the Jira credentials they need.
 unset FULLSEND_JIRA_TOKEN FULLSEND_JIRA_EMAIL FULLSEND_JIRA_CLIENT_ID \
-  FULLSEND_JIRA_CLIENT_SECRET FULLSEND_JIRA_OIDC_TOKEN_FILE JIRA_TOKEN \
+  FULLSEND_JIRA_CLIENT_SECRET FULLSEND_JIRA_OIDC_TOKEN_FD JIRA_TOKEN \
   JIRA_USER_EMAIL JIRA_API_URL
 LIB="${SCRIPT_DIR}/lib/jira-auth.lib.sh"
 
@@ -34,20 +34,33 @@ mkdir -p "${MOCK_BIN}"
 SECRET='sec"ret\value-DO-NOT-LEAK'
 CLIENT_ID="client-id-123"
 API_URL="https://api.atlassian.com/ex/jira/cloud-1"
-# Two JWT-shaped OIDC tokens (the file before and after a refresh) and a
-# self-hosted gateway for the OIDC cases.
+# Two JWT-shaped OIDC tokens (two broker answers) and a self-hosted
+# gateway for the OIDC cases. The fake broker runs the case with one end of
+# a socketpair, as fullsend run does.
 OIDC_TOKEN="test-header.test-payload.oidc-sig-one-DO-NOT-LEAK"
 OIDC_TOKEN_2="test-header.test-payload.oidc-sig-two-DO-NOT-LEAK"
 GATEWAY_URL="https://jira-gw.example.com/ex/jira/cloud-1"
+BROKER="${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py"
+TLS_SERVER="${SCRIPT_DIR}/test-fixtures/jira-oidc-tls-server.py"
 
 # Fake curl: logs its argv, logs stdin when the body is read from stdin,
 # logs the content of a --config file, writes a status line to a
-# --dump-header file (FAKE_GATEWAY_STATUS, default 200), and answers the
+# --dump-header file (FAKE_GATEWAY_STATUS, default 200; a space-separated
+# list gives one status per gateway call, the last repeating), prints a
+# body naming a 401, and answers the
 # Atlassian token endpoint (body + "\n<status>", as --write-out produces).
 # Other calls print a fixed body.
 cat > "${MOCK_BIN}/curl" <<'MOCKEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LOG_DIR}/curl-argv.log"
+# Whether this curl still holds the broker fd (it must not).
+if [[ -n "${TEST_BROKER_FD:-}" ]]; then
+  if { : >&"${TEST_BROKER_FD}"; } 2>/dev/null; then
+    echo "broker-fd=open" >> "${LOG_DIR}/curl-fd.log"
+  else
+    echo "broker-fd=closed" >> "${LOG_DIR}/curl-fd.log"
+  fi
+fi
 url=""
 stdin_body=0
 config=""
@@ -68,7 +81,17 @@ if [[ -n "${config}" ]]; then
   cat "${config}" >> "${LOG_DIR}/curl-config.log"
 fi
 if [[ -n "${dump}" ]]; then
-  printf 'HTTP/2 %s\r\ncontent-type: application/json\r\n\r\n' "${FAKE_GATEWAY_STATUS:-200}" > "${dump}"
+  n=0
+  [[ -f "${LOG_DIR}/gateway-count" ]] && n="$(cat "${LOG_DIR}/gateway-count")"
+  printf '%s' "$((n + 1))" > "${LOG_DIR}/gateway-count"
+  read -r -a statuses <<< "${FAKE_GATEWAY_STATUS:-200}"
+  (( n < ${#statuses[@]} )) || n=$((${#statuses[@]} - 1))
+  status="${statuses[${n}]}"
+  printf 'HTTP/2 %s\r\ncontent-type: application/json\r\n\r\n' "${status}" > "${dump}"
+  if [[ "${status}" == "401" ]]; then
+    printf '{"denied":true}'
+    exit 0
+  fi
 fi
 if [[ "${stdin_body}" -eq 1 ]]; then
   cat >> "${LOG_DIR}/curl-stdin.log"
@@ -106,8 +129,19 @@ fi
 printf 'token=%s email=%s id=%s secret=%s\n' "${FULLSEND_JIRA_TOKEN-unset}" \
   "${FULLSEND_JIRA_EMAIL-unset}" "${FULLSEND_JIRA_CLIENT_ID-unset}" "${secret_state}" \
   >> "${LOG_DIR}/fullsend-env.log"
-printf 'oidc-file=%s oidc-token=%s\n' "${FULLSEND_JIRA_OIDC_TOKEN_FILE-unset}" \
-  "${FULLSEND_JIRA_OIDC_TOKEN:+set}" >> "${LOG_DIR}/fullsend-oidc.log"
+# With a broker fd, ask it for one token as the real CLI would, and log
+# only the answer's first word.
+broker="unset"
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  broker="closed"
+  if { printf 'token\n' >&"${FULLSEND_JIRA_OIDC_TOKEN_FD}"; } 2>/dev/null \
+    && IFS= read -r -t 5 reply <&"${FULLSEND_JIRA_OIDC_TOKEN_FD}"; then
+    broker="answered-${reply%% *}"
+  fi
+fi
+printf 'oidc-fd=%s broker=%s oidc-token=%s\n' "${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" \
+  "${broker}" "${FULLSEND_JIRA_OIDC_TOKEN:+set}" \
+  >> "${LOG_DIR}/fullsend-oidc.log"
 MOCKEOF
 chmod +x "${MOCK_BIN}/fullsend"
 
@@ -120,7 +154,9 @@ fail() {
 
 # run_case NAME BODY — run BODY (bash code) in a fresh bash with the library
 # sourced and the fakes first on PATH. Its stdout is a pipe, as on a CI
-# runner. Sets CASE_DIR, CASE_RC, CASE_OUT and
+# runner. With CASE_BROKER set (broker answers, one per line), the fake
+# broker runs it with FULLSEND_JIRA_OIDC_TOKEN_FD set and logs to
+# CASE_DIR/broker.log. Sets CASE_DIR, CASE_RC, CASE_OUT and
 # CASE_ERR (paths to the captured stdout and stderr).
 run_case() {
   local name="$1"
@@ -130,15 +166,20 @@ run_case() {
   CASE_OUT="${CASE_DIR}/stdout"
   CASE_ERR="${CASE_DIR}/stderr"
   CASE_RC=0
+  local prefix=()
+  if [[ -n "${CASE_BROKER:-}" ]]; then
+    printf '%s\n' "${CASE_BROKER}" > "${CASE_DIR}/broker-answers"
+    prefix=(python3 -I "${BROKER}" "${CASE_DIR}/broker.log" "${CASE_DIR}/broker-answers" --)
+  fi
   env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL -u FULLSEND_JIRA_CLIENT_ID \
     -u FULLSEND_JIRA_CLIENT_SECRET -u JIRA_TOKEN -u JIRA_USER_EMAIL -u JIRA_API_URL \
-    -u FULLSEND_JIRA_OIDC_TOKEN_FILE \
+    -u FULLSEND_JIRA_OIDC_TOKEN_FD -u TEST_BROKER_FD -u CASE_BROKER \
     PATH="${MOCK_BIN}:${PATH}" LOG_DIR="${CASE_DIR}" EXPECTED_SECRET="${SECRET}" \
     TEST_SECRET="${SECRET}" TEST_CLIENT_ID="${CLIENT_ID}" TEST_API_URL="${API_URL}" \
     TEST_OIDC="${OIDC_TOKEN}" TEST_OIDC_2="${OIDC_TOKEN_2}" TEST_GATEWAY="${GATEWAY_URL}" \
     FAKE_MINT="${FAKE_MINT:-ok}" FAKE_EXPIRES_IN="${FAKE_EXPIRES_IN:-3600}" \
     FAKE_GATEWAY_STATUS="${FAKE_GATEWAY_STATUS:-200}" \
-    bash -c "set -euo pipefail; source '${LIB}'; ${body}" \
+    ${prefix[@]+"${prefix[@]}"} bash -c "set -euo pipefail; source '${LIB}'; ${body}" \
     2> "${CASE_ERR}" | cat > "${CASE_OUT}" || CASE_RC=$?
 }
 
@@ -493,7 +534,7 @@ for conflict in "both|tok-4|${CLIENT_ID}|${SECRET}" "token-and-id|tok-4|${CLIENT
   assert_secret_hidden "conflict-${cname}"
 done
 
-# --- Case 5: CI OIDC token file, token sent to a self-hosted Jira gateway ---
+# --- Case 5: CI OIDC tokens from the fd broker, sent to a self-hosted gateway ---
 
 # Assert neither OIDC token is in any argv of a curl or fullsend call or in
 # the case's stdout or stderr. The curl config log is where the token
@@ -511,18 +552,17 @@ assert_oidc_hidden() {
   pass "${name}-oidc-token-hidden"
 }
 
-# Body prefix: write the first token to a 0600 file under the case
-# directory and point FULLSEND_JIRA_OIDC_TOKEN_FILE at it.
-OIDC_SETUP='
-  umask 077
-  printf "%s\n" "${TEST_OIDC}" > "${LOG_DIR}/oidc-token"
-  export FULLSEND_JIRA_OIDC_TOKEN_FILE="${LOG_DIR}/oidc-token"
-'
+# Number of token requests the broker received.
+broker_requests() {
+  grep -c '^request ' "${CASE_DIR}/broker.log" 2>/dev/null || true
+}
 
-# The file is read on every call: replacing it between two calls (an
-# atomic rename, as fullsend run refreshes it) makes the second call send
-# the new token, and no shell variable keeps either token afterwards.
-run_case oidc "${OIDC_SETUP}"'
+# Each call asks the broker for a token and sends that call's answer: two
+# calls send two different tokens. curl does not hold the broker fd, the
+# CLI does and can ask on it, and no shell variable keeps a token.
+CASE_BROKER="ok ${OIDC_TOKEN}
+ok ${OIDC_TOKEN_2}
+ok ${OIDC_TOKEN}" run_case oidc '
   export JIRA_API_URL="${TEST_GATEWAY}/" FULLSEND_JIRA_EMAIL=inherited@example.com
   jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
   echo "mode=${JIRA_AUTH_MODE}"
@@ -532,8 +572,6 @@ run_case oidc "${OIDC_SETUP}"'
   # kept from the first call would still be there for the second.
   jira_auth_curl "" "bot@example.com" "${TEST_GATEWAY}/rest/api/3/myself" > "${LOG_DIR}/captured"
   echo "captured=$(cat "${LOG_DIR}/captured")"
-  printf "%s\n" "${TEST_OIDC_2}" > "${LOG_DIR}/oidc-token.new"
-  mv -f "${LOG_DIR}/oidc-token.new" "${LOG_DIR}/oidc-token"
   jira_auth_curl "" "" "${TEST_GATEWAY}/rest/api/3/issue/X-1" >/dev/null
   printf "body" | jira_auth_fullsend fullsend "" "" issues post-comment --result -
   : reset-underscore
@@ -558,10 +596,16 @@ else
   fail "oidc-sends-bearer-to-gateway-via-config" "$(cat "${CASE_DIR}/curl-argv.log" 2>/dev/null)"
 fi
 if [[ "$(sed -n 1p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN}\"" ]] \
-  && [[ "$(sed -n 2p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN_2}\"" ]]; then
-  pass "oidc-reads-token-file-on-each-call"
+  && [[ "$(sed -n 2p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN_2}\"" ]] \
+  && [[ "$(broker_requests)" -eq 3 ]] && ! grep -qvE '^(request token|inode .*)$' "${CASE_DIR}/broker.log"; then
+  pass "oidc-asks-broker-on-each-call"
 else
-  fail "oidc-reads-token-file-on-each-call" "the second call did not send the refreshed token"
+  fail "oidc-asks-broker-on-each-call" "$(cat "${CASE_DIR}/broker.log" 2>/dev/null)"
+fi
+if [[ "$(sort -u "${CASE_DIR}/curl-fd.log")" == "broker-fd=closed" ]]; then
+  pass "oidc-curl-does-not-hold-broker-fd"
+else
+  fail "oidc-curl-does-not-hold-broker-fd" "$(cat "${CASE_DIR}/curl-fd.log" 2>/dev/null)"
 fi
 if grep -qx "cached=no" "${CASE_OUT}"; then
   pass "oidc-token-not-kept-in-shell-variables"
@@ -569,16 +613,17 @@ else
   fail "oidc-token-not-kept-in-shell-variables" "a shell variable still holds an OIDC token"
 fi
 if grep -qx "token=unset email=unset id=unset secret=unset" "${CASE_DIR}/fullsend-env.log" \
-  && grep -qx "oidc-file=${CASE_DIR}/oidc-token oidc-token=" "${CASE_DIR}/fullsend-oidc.log"; then
-  pass "oidc-fullsend-gets-token-file-only"
+  && grep -qE "^oidc-fd=[0-9]+ broker=answered-ok oidc-token=$" "${CASE_DIR}/fullsend-oidc.log"; then
+  pass "oidc-fullsend-inherits-broker-fd-only"
 else
-  fail "oidc-fullsend-gets-token-file-only" "$(cat "${CASE_DIR}/fullsend-env.log" "${CASE_DIR}/fullsend-oidc.log" 2>/dev/null)"
+  fail "oidc-fullsend-inherits-broker-fd-only" "$(cat "${CASE_DIR}/fullsend-env.log" "${CASE_DIR}/fullsend-oidc.log" 2>/dev/null)"
 fi
 assert_oidc_hidden "oidc"
 
 # xtrace on through select, curl and the fullsend call: no trace line
 # carries the token.
-run_case oidc-xtrace "${OIDC_SETUP}"'
+CASE_BROKER="ok ${OIDC_TOKEN}
+ok ${OIDC_TOKEN}" run_case oidc-xtrace '
   export JIRA_API_URL="${TEST_GATEWAY}"
   set -x
   jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
@@ -594,23 +639,42 @@ else
 fi
 assert_oidc_hidden "oidc-xtrace"
 
-# A saved copy of the path under another name (as post-code.sh passes it)
-# selects OIDC.
-run_case oidc-named "${OIDC_SETUP}"'
-  saved_file="${FULLSEND_JIRA_OIDC_TOKEN_FILE}"
-  unset FULLSEND_JIRA_OIDC_TOKEN_FILE
-  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET saved_file
+# A saved copy of the fd number under another name (as post-code.sh passes
+# it) selects OIDC.
+CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-named '
+  saved_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD}"
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET saved_fd
   echo "mode=${JIRA_AUTH_MODE}"
   jira_auth_fullsend fullsend "" "" issues get
 '
 if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "mode=oidc" "${CASE_OUT}" \
-  && grep -qx "oidc-file=${CASE_DIR}/oidc-token oidc-token=" "${CASE_DIR}/fullsend-oidc.log"; then
+  && grep -q "broker=answered-ok" "${CASE_DIR}/fullsend-oidc.log"; then
   pass "oidc-named-variable"
 else
   fail "oidc-named-variable" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
 fi
 
-# The token file next to a token or client credentials fails, naming the
+# jira_auth_drop_oidc_fd closes the fd and unsets the variable: a child
+# started after it holds neither, and a later Jira call fails clearly.
+CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-drop '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  ( jira_auth_drop_oidc_fd; bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo child-fd=open || echo child-fd=closed; echo child-var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" )
+  bash -c "{ : >&${TEST_BROKER_FD}; } 2>/dev/null && echo parent-fd=open || echo parent-fd=closed"
+  jira_auth_drop_oidc_fd
+  if jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself"; then echo after=ok; else echo after=refused; fi
+'
+if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "child-fd=closed" "${CASE_OUT}" && grep -qx "child-var=unset" "${CASE_OUT}" \
+  && grep -qx "parent-fd=open" "${CASE_OUT}" && grep -qx "after=refused" "${CASE_OUT}" \
+  && grep -qF "token broker is not open" "${CASE_ERR}" && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+  pass "oidc-drop-closes-fd-and-unsets-variable"
+else
+  fail "oidc-drop-closes-fd-and-unsets-variable" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
+
+# The broker fd next to a token or client credentials fails, naming the
 # variables and never the values, before any call.
 for conflict in "token-arg" "token-env" "client-pair" "client-id-only"; do
   case "${conflict}" in
@@ -619,15 +683,15 @@ for conflict in "token-arg" "token-env" "client-pair" "client-id-only"; do
     client-pair) setup='jira_auth_select "" TEST_CLIENT_ID TEST_SECRET' ;;
     client-id-only) setup='jira_auth_select "" TEST_CLIENT_ID UNSET_SECRET' ;;
   esac
-  run_case "oidc-conflict-${conflict}" "${OIDC_SETUP}
+  CASE_BROKER="ok ${OIDC_TOKEN}" run_case "oidc-conflict-${conflict}" "
     export JIRA_API_URL=\"\${TEST_GATEWAY}\"
     ${setup}
     jira_auth_curl '' '' \"\${TEST_GATEWAY}/rest/api/3/myself\"
   "
-  if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE" "${CASE_ERR}" \
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FD" "${CASE_ERR}" \
     && grep -qE "FULLSEND_JIRA_TOKEN|FULLSEND_JIRA_CLIENT_ID" "${CASE_ERR}" \
     && ! grep -qF "tok-5" "${CASE_ERR}" && ! grep -qF "${CLIENT_ID}" "${CASE_ERR}" \
-    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" && "$(broker_requests)" -eq 0 ]]; then
     pass "oidc-conflict-${conflict}-fails"
   else
     fail "oidc-conflict-${conflict}-fails" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
@@ -636,49 +700,63 @@ for conflict in "token-arg" "token-env" "client-pair" "client-id-only"; do
   assert_secret_hidden "oidc-conflict-${conflict}"
 done
 
-# A missing, empty or unreadable file, or one that holds no JWT, fails the
-# REST call and the CLI call with a clear error and calls neither. A
-# directory stands in for an unreadable file, since root can read a 0000
-# file; the 0000 case runs only when not root.
-file_cases="missing empty directory not-jwt"
-[[ "$(id -u)" -ne 0 ]] && file_cases="${file_cases} mode-0000"
-for fcase in ${file_cases}; do
-  case "${fcase}" in
-    missing) fsetup='rm -f "${LOG_DIR}/oidc-token"'; want="file is missing" ;;
-    empty) fsetup=': > "${LOG_DIR}/oidc-token"'; want="file is empty" ;;
-    directory) fsetup='rm -f "${LOG_DIR}/oidc-token"; mkdir "${LOG_DIR}/oidc-token"'; want="not a readable file" ;;
-    not-jwt) fsetup='printf "not-a-jwt-DO-NOT-LEAK\n" > "${LOG_DIR}/oidc-token"'; want="does not hold a JWT" ;;
-    mode-0000) fsetup='chmod 000 "${LOG_DIR}/oidc-token"'; want="not a readable file" ;;
-  esac
-  run_case "oidc-file-${fcase}" "${OIDC_SETUP}
+# An fd value that is not a number from 3 up is refused at select.
+for badfd in "abc" "1" "-4" "99999"; do
+  run_case "oidc-bad-fd" "
+    export FULLSEND_JIRA_OIDC_TOKEN_FD='${badfd}'
+    jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  "
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "file descriptor number from 3 up" "${CASE_ERR}"; then
+    pass "oidc-bad-fd-'${badfd}'-refused"
+  else
+    fail "oidc-bad-fd-'${badfd}'-refused" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+  fi
+  rm -rf "${CASE_DIR}"
+done
+
+# Broker failures fail the call before curl, with a clear message, and the
+# answer line is never printed: err <code>, no answer in time, a closed
+# broker, an unexpected answer, a malformed err, an ok without a JWT, and
+# an fd that is not open at all.
+for bcase in "err|err fetch_failed|could not supply a token (err fetch_failed)" \
+  "timeout|hang|did not answer within 1s" \
+  "closed|close|closed without an answer" \
+  "unexpected|okay-DO-NOT-LEAK|sent an unexpected answer" \
+  "bad-err|err Bad Code DO-NOT-LEAK|sent a malformed error" \
+  "not-jwt|ok not-a-jwt-DO-NOT-LEAK|did not send a JWT" \
+  "not-open||token broker is not open"; do
+  IFS='|' read -r bname banswer bwant <<< "${bcase}"
+  fd_setup=''
+  [[ "${bname}" == "not-open" ]] && fd_setup='export FULLSEND_JIRA_OIDC_TOKEN_FD=97'
+  CASE_BROKER="${banswer}" run_case "oidc-broker-${bname}" "
+    ${fd_setup}
     export JIRA_API_URL=\"\${TEST_GATEWAY}\"
     jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
-    ${fsetup}
+    _JIRA_AUTH_OIDC_TIMEOUT=1
     if jira_auth_curl '' '' \"\${TEST_GATEWAY}/rest/api/3/myself\"; then echo curl=ok; else echo curl=refused; fi
-    if jira_auth_fullsend fullsend '' '' issues get; then echo cli=ok; else echo cli=refused; fi
   "
-  cli_want="cli=refused"
-  # The CLI reads the token itself; the library checks only that the file
-  # is there, readable and non-empty.
-  [[ "${fcase}" == "not-jwt" ]] && cli_want="cli=ok"
-  if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "curl=refused" "${CASE_OUT}" && grep -qx "${cli_want}" "${CASE_OUT}" \
-    && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE file" "${CASE_ERR}" && grep -qF "${want}" "${CASE_ERR}" \
-    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]] \
+  if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "curl=refused" "${CASE_OUT}" \
+    && grep -qF "${bwant}" "${CASE_ERR}" && [[ ! -f "${CASE_DIR}/curl-argv.log" ]] \
     && ! grep -qF "DO-NOT-LEAK" "${CASE_OUT}" "${CASE_ERR}"; then
-    pass "oidc-file-${fcase}-refused"
+    pass "oidc-broker-${bname}-fails-clearly"
   else
-    fail "oidc-file-${fcase}-refused" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+    fail "oidc-broker-${bname}-fails-clearly" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
   fi
 done
 
 # The CI token never goes to Atlassian or over plain http, and an unset
-# JIRA_API_URL has no fallback: both the up-front check and the call refuse.
+# JIRA_API_URL has no fallback. The host must be a plain lowercase DNS name:
+# no user info, percent-encoding or backslash. Both the up-front check and
+# the call refuse, before asking the broker.
 for api in "unset" "https://api.atlassian.com/ex/jira/cloud-1" "https://site.atlassian.net" \
   "https://API.Atlassian.COM./ex/jira/cloud-1" "https://gw.example.com@api.atlassian.com/ex/jira/c" \
-  "https://jira.atlassian.com:443/x" "http://jira-gw.example.com/ex/jira/cloud-1"; do
+  "https://jira.atlassian.com:443/x" "http://jira-gw.example.com/ex/jira/cloud-1" \
+  "https://api.atlassian%2Ecom/ex/jira/cloud-1" "https://atlass%69an.net/" \
+  "https://jira-gw.example.com\\@api.atlassian.com/x" "https://jira-gw.example.com:/x" \
+  "https://jira-gw.example.com:44a/x" "https://-gw.example.com/x"; do
   api_setup="export JIRA_API_URL='${api}'"
   [[ "${api}" == "unset" ]] && api_setup="export JIRA_BASE_URL=https://site.atlassian.net"
-  run_case "oidc-api-url" "${OIDC_SETUP}
+  CASE_BROKER="ok ${OIDC_TOKEN}" run_case "oidc-api-url" "
     ${api_setup}
     jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
     if jira_auth_require_api_url; then echo require=ok; else echo require=refused; fi
@@ -686,7 +764,7 @@ for api in "unset" "https://api.atlassian.com/ex/jira/cloud-1" "https://site.atl
   "
   if [[ "${CASE_RC}" -ne 0 ]] && grep -qx "require=refused" "${CASE_OUT}" \
     && grep -qF "JIRA_API_URL" "${CASE_ERR}" \
-    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" && "$(broker_requests)" -eq 0 ]]; then
     pass "oidc-refuses-api-url-'${api}'"
   else
     fail "oidc-refuses-api-url-'${api}'" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
@@ -695,35 +773,164 @@ for api in "unset" "https://api.atlassian.com/ex/jira/cloud-1" "https://site.atl
   rm -rf "${CASE_DIR}"
 done
 
-# A URL argument outside JIRA_API_URL is refused, even with a good gateway.
-run_case oidc-other-url "${OIDC_SETUP}"'
-  export JIRA_API_URL="${TEST_GATEWAY}"
+# The CLI call checks the gateway too, so a bad JIRA_API_URL never starts
+# the CLI with the broker fd.
+CASE_BROKER="ok ${OIDC_TOKEN}" run_case oidc-cli-api-url '
+  export JIRA_API_URL="https://api.atlassian.com/ex/jira/cloud-1"
   jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
-  jira_auth_curl "" "" "https://site.atlassian.net/rest/api/3/myself"
+  jira_auth_fullsend fullsend "" "" issues get
 '
-if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "outside JIRA_API_URL" "${CASE_ERR}" \
-  && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
-  pass "oidc-refuses-url-outside-api-url"
+if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "Atlassian host" "${CASE_ERR}" \
+  && [[ ! -f "${CASE_DIR}/fullsend-argv.log" ]]; then
+  pass "oidc-cli-checks-gateway-first"
 else
-  fail "oidc-refuses-url-outside-api-url" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+  fail "oidc-cli-checks-gateway-first" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
 fi
 
-# A 401 from the gateway fails with its own message, once: no retry, no
-# mint, no other credential.
-FAKE_GATEWAY_STATUS=401 run_case oidc-401 "${OIDC_SETUP}"'
+# A URL argument outside JIRA_API_URL, and curl options that would print
+# or redirect the headers, read another config, follow redirects or change
+# the default scheme, are refused before the broker is asked.
+for bad in "https://site.atlassian.net/rest/api/3/myself" -v --verbose --trace --trace-ascii \
+  --trace-config --stderr -K --config -D --dump-header -L --location --location-trusted \
+  --proto-default -sv -sSL @-; do
+  CASE_BROKER="ok ${OIDC_TOKEN}" run_case "oidc-bad-arg" "
+    export JIRA_API_URL=\"\${TEST_GATEWAY}\"
+    jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+    jira_auth_curl '' '' --silent '${bad}' \"\${TEST_GATEWAY}/rest/api/3/myself\"
+  "
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qE "outside JIRA_API_URL|is not allowed with the OIDC token" "${CASE_ERR}" \
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" && "$(broker_requests)" -eq 0 ]]; then
+    pass "oidc-refuses-curl-arg-'${bad}'"
+  else
+    fail "oidc-refuses-curl-arg-'${bad}'" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+  fi
+  rm -rf "${CASE_DIR}"
+done
+
+# A 401 makes the call ask the broker to refresh and try once more with
+# the new token. When that succeeds, the caller sees only the second
+# response; the refused attempt's body never reaches it.
+CASE_BROKER="ok ${OIDC_TOKEN}
+ok ${OIDC_TOKEN_2}" FAKE_GATEWAY_STATUS="401 200" run_case oidc-401-refresh-ok '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" --silent --write-out "\n%{http_code}" "${JIRA_API_URL}/rest/api/3/myself" > "${LOG_DIR}/body"
+  echo "rc=$?"
+'
+if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "rc=0" "${CASE_OUT}" \
+  && [[ "$(cat "${CASE_DIR}/body")" == '{"ok":true}' ]] \
+  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 2 ]] \
+  && [[ "$(grep '^request ' "${CASE_DIR}/broker.log" | tr '\n' ' ')" == "request token request refresh " ]] \
+  && [[ "$(sed -n 2p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN_2}\"" ]] \
+  && grep -qF "retrying once" "${CASE_ERR}" && [[ ! -f "${CASE_DIR}/mint-count" ]]; then
+  pass "oidc-401-refresh-then-success"
+else
+  fail "oidc-401-refresh-then-success" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}" "${CASE_DIR}/body" 2>/dev/null)"
+fi
+assert_oidc_hidden "oidc-401-refresh-ok"
+
+# A second 401 after the refresh fails with its own message after exactly
+# two attempts: no third try, no mint, no other credential.
+CASE_BROKER="ok ${OIDC_TOKEN}
+ok ${OIDC_TOKEN_2}
+ok ${OIDC_TOKEN}" FAKE_GATEWAY_STATUS="401 401" run_case oidc-401-twice '
   export JIRA_API_URL="${TEST_GATEWAY}"
   jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
   jira_auth_curl "" "" --fail --silent "${JIRA_API_URL}/rest/api/3/myself"
 '
 if [[ "${CASE_RC}" -ne 0 ]] \
-  && grep -qF "HTTP 401: OIDC token refused or expired. Not retrying with another credential." "${CASE_ERR}" \
-  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 1 ]] \
+  && grep -qF "OIDC token refused or expired. Not retrying with another credential." "${CASE_ERR}" \
+  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 2 && "$(broker_requests)" -eq 2 ]] \
+  && [[ "$(grep '^request ' "${CASE_DIR}/broker.log" | tr '\n' ' ')" == "request token request refresh " ]] \
   && [[ ! -f "${CASE_DIR}/mint-count" ]]; then
-  pass "oidc-401-fails-without-retry"
+  pass "oidc-401-refresh-then-401-fails-after-two-attempts"
 else
-  fail "oidc-401-fails-without-retry" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+  fail "oidc-401-refresh-then-401-fails-after-two-attempts" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
 fi
-assert_oidc_hidden "oidc-401"
+assert_oidc_hidden "oidc-401-twice"
+
+# A broker error on the refresh fails the call without a second attempt.
+CASE_BROKER="ok ${OIDC_TOKEN}
+err fetch_failed" FAKE_GATEWAY_STATUS="401 200" run_case oidc-401-refresh-err '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" --silent "${JIRA_API_URL}/rest/api/3/myself"
+'
+if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "(err fetch_failed)" "${CASE_ERR}" \
+  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 1 ]]; then
+  pass "oidc-401-refresh-error-fails"
+else
+  fail "oidc-401-refresh-error-fails" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+
+# Real curl against a local HTTPS listener with a self-signed certificate
+# (--cacert): the Bearer header arrives, a 401 fails with its message, and
+# a 404 under --fail keeps curl's exit code 22. Skipped when openssl or the
+# listener is unavailable.
+REAL_DIR="${TMPDIR_ROOT}/real-curl"
+mkdir -p "${REAL_DIR}"
+real_skip=""
+if ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  real_skip="openssl or curl not installed"
+elif ! openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost" -keyout "${REAL_DIR}/key.pem" \
+  -out "${REAL_DIR}/cert.pem" >/dev/null 2>&1; then
+  real_skip="could not create a self-signed certificate"
+else
+  python3 -I "${TLS_SERVER}" "${REAL_DIR}/cert.pem" "${REAL_DIR}/key.pem" \
+    "${REAL_DIR}/port" "${REAL_DIR}/server.log" 2>"${REAL_DIR}/server.err" &
+  REAL_PID=$!
+  for _ in $(seq 1 50); do
+    [[ -s "${REAL_DIR}/port" ]] && break
+    kill -0 "${REAL_PID}" 2>/dev/null || break
+    sleep 0.1
+  done
+  [[ -s "${REAL_DIR}/port" ]] || real_skip="the TLS listener did not start"
+fi
+if [[ -n "${real_skip}" ]]; then
+  echo "SKIP: oidc-real-curl (${real_skip})"
+else
+  REAL_GW="https://localhost:$(cat "${REAL_DIR}/port")/ex/jira/cloud-1"
+  # myself; denied, then its refresh; missing.
+  printf 'ok %s\nok %s\nok %s\nok %s\n' "${OIDC_TOKEN}" "${OIDC_TOKEN}" "${OIDC_TOKEN_2}" "${OIDC_TOKEN}" \
+    > "${REAL_DIR}/answers"
+  REAL_RC=0
+  env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET -u JIRA_TOKEN \
+    JIRA_API_URL="${REAL_GW}" CACERT="${REAL_DIR}/cert.pem" \
+    python3 -I "${BROKER}" "${REAL_DIR}/broker.log" "${REAL_DIR}/answers" -- \
+    bash -c "set -uo pipefail; source '${LIB}'
+      jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
+      body=\"\$(jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/myself\")\"; echo \"ok-rc=\$? body=\${body}\"
+      jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/denied\" >/dev/null; echo \"denied-rc=\$?\"
+      jira_auth_curl '' '' --fail --silent --show-error --cacert \"\${CACERT}\" \"\${JIRA_API_URL}/rest/api/3/missing\" >/dev/null; echo \"missing-rc=\$?\"
+    " > "${REAL_DIR}/out" 2> "${REAL_DIR}/err" || REAL_RC=$?
+  kill "${REAL_PID}" 2>/dev/null || true
+  wait "${REAL_PID}" 2>/dev/null || true
+  if [[ "${REAL_RC}" -eq 0 ]] && grep -qx 'ok-rc=0 body={"ok":true}' "${REAL_DIR}/out" \
+    && grep -qxF "/ex/jira/cloud-1/rest/api/3/myself Bearer ${OIDC_TOKEN}" "${REAL_DIR}/server.log"; then
+    pass "oidc-real-curl-sends-bearer"
+  else
+    fail "oidc-real-curl-sends-bearer" "rc=${REAL_RC}; $(cat "${REAL_DIR}/out" "${REAL_DIR}/err" "${REAL_DIR}/server.log" 2>/dev/null)"
+  fi
+  if grep -qx "denied-rc=1" "${REAL_DIR}/out" \
+    && grep -qF "OIDC token refused or expired" "${REAL_DIR}/err" \
+    && [[ "$(grep '/denied ' "${REAL_DIR}/server.log" | tr '\n' ' ')" \
+      == "/ex/jira/cloud-1/rest/api/3/denied Bearer ${OIDC_TOKEN} /ex/jira/cloud-1/rest/api/3/denied Bearer ${OIDC_TOKEN_2} " ]]; then
+    pass "oidc-real-curl-401-refreshes-once-then-fails"
+  else
+    fail "oidc-real-curl-401-refreshes-once-then-fails" "$(cat "${REAL_DIR}/out" "${REAL_DIR}/err" 2>/dev/null)"
+  fi
+  if grep -qx "missing-rc=22" "${REAL_DIR}/out"; then
+    pass "oidc-real-curl-keeps-fail-exit-code"
+  else
+    fail "oidc-real-curl-keeps-fail-exit-code" "$(cat "${REAL_DIR}/out" 2>/dev/null)"
+  fi
+  if ! grep -qF "${OIDC_TOKEN}" "${REAL_DIR}/out" "${REAL_DIR}/err"; then
+    pass "oidc-real-curl-token-hidden"
+  else
+    fail "oidc-real-curl-token-hidden" "OIDC token in output"
+  fi
+fi
 
 echo ""
 if [ ${FAILURES} -gt 0 ]; then

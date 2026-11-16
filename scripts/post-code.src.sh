@@ -35,10 +35,10 @@
 # optional: when set, the write uses bot-user Basic auth; when unset or
 # empty, service-account Bearer auth. FULLSEND_JIRA_CLIENT_ID and
 # FULLSEND_JIRA_CLIENT_SECRET can replace JIRA_TOKEN (service-account OAuth
-# 2.0 client credentials), and FULLSEND_JIRA_OIDC_TOKEN_FILE can replace
-# both (the file holding a CI OIDC token for a self-hosted Jira gateway,
-# tracker.jira.auth: oidc); setting more than one mode fails the Jira
-# write. JIRA_BASE_URL is optional and
+# 2.0 client credentials), and FULLSEND_JIRA_OIDC_TOKEN_FD can replace both
+# (the fd of the CI OIDC token broker for a self-hosted Jira gateway,
+# tracker.jira.auth: oidc; see "Jira OIDC token broker" below); setting more
+# than one mode fails the Jira write. JIRA_BASE_URL is optional and
 # cross-checked against the work-item URL. GitLab targets take the GitLab
 # host from CI_SERVER_HOST.
 #
@@ -95,7 +95,7 @@ _jira_token_saved=""
 _jira_email_saved=""
 _jira_client_id_saved=""
 _jira_client_secret_saved=""
-_jira_oidc_token_file_saved=""
+_jira_oidc_fd_saved=""
 # Keep credentials off the trace: xtrace off for the stash, restored after.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
@@ -103,26 +103,118 @@ if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
   unset _POST_CODE_JIRA_FD
   { IFS= read -r -d '' _jira_token_saved || true; IFS= read -r -d '' _jira_email_saved || true
     IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true
-    IFS= read -r -d '' _jira_oidc_token_file_saved || true; } \
+    IFS= read -r -d '' _jira_oidc_fd_saved || true; } \
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
-elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FILE:-}" ]]; then
+elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
   _jira_stash_file="$(mktemp)"
   exec {_jira_stash_fd}<>"${_jira_stash_file}"
   rm -f "${_jira_stash_file}"
   printf '%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
     "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" \
-    "${FULLSEND_JIRA_OIDC_TOKEN_FILE-}" >&"${_jira_stash_fd}"
+    "${FULLSEND_JIRA_OIDC_TOKEN_FD-}" >&"${_jira_stash_fd}"
   exec env -u JIRA_TOKEN -u JIRA_USER_EMAIL -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL \
     -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
-    -u FULLSEND_JIRA_OIDC_TOKEN_FILE \
+    -u FULLSEND_JIRA_OIDC_TOKEN_FD \
     _POST_CODE_JIRA_FD="${_jira_stash_fd}" "${BASH}" "${BASH_SOURCE[0]}" "$@"
 fi
 (( _jira_xtrace_was_on )) && set -x
 unset _jira_xtrace_was_on
 
 SCRIPT_DIR_POST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/jira-auth.lib.sh
+source "${SCRIPT_DIR_POST}/lib/jira-auth.lib.sh"
+
+# ---------------------------------------------------------------------------
+# Jira OIDC token broker (tracker.jira.auth: oidc)
+#
+# With FULLSEND_JIRA_OIDC_TOKEN_FD, fullsend run gives this script one end
+# of a socket that hands out CI OIDC tokens. Repo-controlled code (git and
+# its hooks, pre-commit and its installs, gitleaks, gh) must never hold
+# that fd. The Jira write is this script's last step on every path, so this
+# process becomes a holder: it runs the script again as a worker child with
+# the fd closed and the variable unset, so nothing the worker starts can
+# reach the broker, waits for it, and then makes the one Jira write the
+# worker asked for. The worker passes only the update phrase and the PR/MR
+# URL, through a private file. The holder rebuilds the comment from its own
+# environment and accepts only a PR/MR URL of REPO_FULL_NAME, so a hook
+# that rewrites the file can at most change which PR/MR of this repository
+# the comment names.
+# ---------------------------------------------------------------------------
+_post_code_jira_holder() {
+  local fd="${_jira_oidc_fd_saved}"
+  if [[ ! "${fd}" =~ ^[0-9]{1,4}$ ]] || (( 10#${fd} < 3 )); then
+    echo "::error::FULLSEND_JIRA_OIDC_TOKEN_FD must be a file descriptor number from 3 up"
+    exit 1
+  fi
+  fd="$((10#${fd}))"
+  # Resolve the trusted tracker CLI before the worker can install anything.
+  local bin defer rc=0
+  bin="$(command -v fullsend 2>/dev/null || true)"
+  defer="$(mktemp)" || exit 1
+  (
+    eval "exec ${fd}<&-"
+    exec env -u FULLSEND_JIRA_OIDC_TOKEN_FD _POST_CODE_JIRA_DEFER="${defer}" \
+      "${BASH}" "${BASH_SOURCE[0]}" "$@"
+  ) || rc=$?
+  local verb="" url=""
+  { IFS= read -r -d '' verb || true; IFS= read -r -d '' url || true; } < "${defer}"
+  rm -f "${defer}"
+  if [[ "${rc}" -ne 0 ]]; then
+    exit "${rc}"
+  fi
+  # No request: the worker made no PR/MR to report (or this is not a Jira
+  # run).
+  [[ -n "${verb}${url}" ]] || exit 0
+
+  local key="${FULLSEND_WORK_ITEM_KEY:-}"
+  _post_code_jira_holder_fail() {
+    echo "::error::$1"
+    echo "::error::Failed to write the code-stage update to Jira issue ${key}"
+    exit 1
+  }
+  case "${verb}" in
+    "opened" | "pushed new commits to") ;;
+    *) _post_code_jira_holder_fail "Unexpected code-stage update from the worker" ;;
+  esac
+  if [[ ! "${url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/(.+)/(pull|-/merge_requests)/[0-9]+$ ]] \
+    || [[ "${BASH_REMATCH[2]}" != "${REPO_FULL_NAME:-}" ]]; then
+    _post_code_jira_holder_fail "The PR/MR URL from the worker is not a PR/MR of REPO_FULL_NAME"
+  fi
+  if [[ ! "${FULLSEND_WORK_ITEM_URL:-}" =~ ^https://([a-zA-Z0-9.-]+\.atlassian\.net)/browse/([A-Z][A-Z0-9]*)-([0-9]+)$ ]]; then
+    _post_code_jira_holder_fail "FULLSEND_WORK_ITEM_URL is not a Jira Cloud issue URL"
+  fi
+  local project="${BASH_REMATCH[2]}" number="${BASH_REMATCH[3]}"
+  if [[ "${project}-${number}" != "${key}" ]]; then
+    _post_code_jira_holder_fail "FULLSEND_WORK_ITEM_KEY does not match the Jira issue in FULLSEND_WORK_ITEM_URL"
+  fi
+  if ! jira_auth_select "${_jira_token_saved:-}" \
+    _jira_client_id_saved _jira_client_secret_saved _jira_oidc_fd_saved; then
+    _post_code_jira_holder_fail "Conflicting Jira credentials; cannot write to Jira"
+  fi
+  [[ -n "${FULLSEND_DIR:-}" ]] || _post_code_jira_holder_fail "FULLSEND_DIR is required to write to Jira (the fullsend CLI reads tracker.jira from its config.yaml)"
+  [[ -n "${bin}" ]] || _post_code_jira_holder_fail "fullsend CLI not found; cannot write to Jira"
+  local noun="pull request"
+  if [[ "${FULLSEND_FORGE:-}" == "gitlab" ]]; then
+    noun="merge request"
+  fi
+  local body="**Code stage:** ${verb} ${noun} ${url} for ${key}.
+
+Review and merge happen on the ${noun}."
+  if ! printf '%s' "${body}" | jira_auth_fullsend "${bin}" "${_jira_token_saved:-}" "${_jira_email_saved:-}" \
+    issues post-comment --tracker jira --fullsend-dir "${FULLSEND_DIR}" \
+    --project "${project}" --number "${number}" \
+    --marker "<!-- fullsend:code-agent -->" --result -; then
+    echo "::error::Failed to write the code-stage update to Jira issue ${key}"
+    exit 1
+  fi
+  exit 0
+}
+if [[ -n "${_jira_oidc_fd_saved}" ]]; then
+  _post_code_jira_holder "$@"
+fi
+
 # shellcheck source=lib/git-graph-policy.lib.sh
 source "${SCRIPT_DIR_POST}/lib/git-graph-policy.lib.sh"
 # shellcheck source=lib/post-failure-report.lib.sh
@@ -135,8 +227,6 @@ source "${SCRIPT_DIR_POST}/lib/precommit-gate.lib.sh"
 source "${SCRIPT_DIR_POST}/lib/pr-assignee.lib.sh"
 # shellcheck source=lib/branch-guard.lib.sh
 source "${SCRIPT_DIR_POST}/lib/branch-guard.lib.sh"
-# shellcheck source=lib/jira-auth.lib.sh
-source "${SCRIPT_DIR_POST}/lib/jira-auth.lib.sh"
 
 # SCRIPT_DIR is used by code-ops.lib.sh dispatcher to locate forge-specific
 # ops libraries. Not directly referenced in this file.
@@ -568,14 +658,20 @@ post_jira_stage_update() {
   # CLI below and nowhere else. The email is optional: without it the CLI
   # uses service-account Bearer auth. Client credentials replace the token,
   # and the CLI mints its own access token from them.
+  # With a token broker this process is the worker (see "Jira OIDC token
+  # broker"): it has no Jira credential and no broker fd, so it hands the
+  # update to the holder, which makes the write after this process exits.
+  if [ -n "${_POST_CODE_JIRA_DEFER:-}" ]; then
+    printf '%s\0%s\0' "${verb}" "${pr_url}" > "${_POST_CODE_JIRA_DEFER}"
+    return 0
+  fi
   if ! jira_auth_select "${_jira_token_saved:-}" \
-    _jira_client_id_saved _jira_client_secret_saved \
-    _jira_oidc_token_file_saved; then
+    _jira_client_id_saved _jira_client_secret_saved; then
     gha_echo error "Conflicting Jira credentials; cannot write to Jira"
     return 1
   fi
   if [ "${JIRA_AUTH_MODE}" = "none" ]; then
-    gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FILE)"
+    gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD)"
     return 1
   fi
   if [ -z "${FULLSEND_DIR:-}" ]; then

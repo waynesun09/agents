@@ -31,12 +31,11 @@
 #                            REST calls then use an access token minted on
 #                            the runner and need JIRA_API_URL. Setting both
 #                            modes fails.
-#   FULLSEND_JIRA_OIDC_TOKEN_FILE
-#                          — or the file fullsend run keeps a CI OIDC
-#                            token in (tracker.jira.auth: oidc); read on
-#                            each call and sent only to JIRA_API_URL, a
-#                            self-hosted Jira gateway. Alone, never with
-#                            the above.
+#   FULLSEND_JIRA_OIDC_TOKEN_FD
+#                          — or the fd of the token broker fullsend run passes
+#                            (tracker.jira.auth: oidc); asked on each call, and
+#                            the token sent only to JIRA_API_URL, a self-hosted
+#                            Jira gateway. Alone, never with the above.
 #   FULLSEND_DIR           — .fullsend directory whose config.yaml holds
 #                            tracker.jira, for `fullsend issues create`
 #   SCRIBE_JIRA_PROJECT    — Jira project key that backlog reads and new
@@ -69,7 +68,7 @@ JIRA_SCRIBE_OPS_SH_LOADED=1
 source "${SCRIPT_DIR}/lib/jira-auth.lib.sh"
 jira_auth_select "${JIRA_TOKEN:-}" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
 if [[ "${JIRA_AUTH_MODE}" == "none" ]]; then
-  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FILE" >&2
+  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD" >&2
   exit 1
 fi
 : "${JIRA_BASE_URL:?JIRA_BASE_URL must be set}"

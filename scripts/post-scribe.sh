@@ -748,12 +748,11 @@ case "${FULLSEND_TRACKER}" in
 #                            REST calls then use an access token minted on
 #                            the runner and need JIRA_API_URL. Setting both
 #                            modes fails.
-#   FULLSEND_JIRA_OIDC_TOKEN_FILE
-#                          — or the file fullsend run keeps a CI OIDC
-#                            token in (tracker.jira.auth: oidc); read on
-#                            each call and sent only to JIRA_API_URL, a
-#                            self-hosted Jira gateway. Alone, never with
-#                            the above.
+#   FULLSEND_JIRA_OIDC_TOKEN_FD
+#                          — or the fd of the token broker fullsend run passes
+#                            (tracker.jira.auth: oidc); asked on each call, and
+#                            the token sent only to JIRA_API_URL, a self-hosted
+#                            Jira gateway. Alone, never with the above.
 #   FULLSEND_DIR           — .fullsend directory whose config.yaml holds
 #                            tracker.jira, for `fullsend issues create`
 #   SCRIBE_JIRA_PROJECT    — Jira project key that backlog reads and new
@@ -799,16 +798,22 @@ JIRA_SCRIBE_OPS_SH_LOADED=1
 #                        Bearer access token minted on the runner, and the
 #                        fullsend CLI gets the client credentials and mints
 #                        for itself
-#   oidc               — tracker.jira.auth: oidc. fullsend run sets
-#                        FULLSEND_JIRA_OIDC_TOKEN_FILE, the path of a
-#                        0600 file holding a CI OIDC token that it keeps
-#                        fresh while the script runs. Each REST call reads
-#                        the file at that moment and sends the token as
-#                        Bearer to JIRA_API_URL, a self-hosted Jira
-#                        gateway, never to an Atlassian host; the fullsend
-#                        CLI gets the path. The token is never kept between
-#                        calls. A refused token fails the call, with no
-#                        retry and no other credential.
+#   oidc               — tracker.jira.auth: oidc. fullsend run passes
+#                        the script one end of a socket, a token broker,
+#                        and its number in FULLSEND_JIRA_OIDC_TOKEN_FD.
+#                        Each REST call asks it for a token ("token\n",
+#                        answered "ok <jwt>\n" or "err <code>\n"), sends
+#                        the token as Bearer to JIRA_API_URL, a
+#                        self-hosted Jira gateway, never to an Atlassian
+#                        host, and forgets it. The fullsend CLI inherits
+#                        the fd and asks for itself. After a 401 a call
+#                        asks once more with "refresh\n" and retries one
+#                        time; a second refusal fails the call, and no
+#                        other credential is ever tried.
+#                        Requests are sequential: never ask on the same
+#                        fd from two processes at once. Children that run
+#                        agent or third-party code must not hold the fd:
+#                        see jira_auth_drop_oidc_fd.
 #
 # An email that is empty or only whitespace counts as absent. A harness
 # that maps an unset FULLSEND_JIRA_EMAIL to JIRA_USER_EMAIL yields an empty
@@ -836,8 +841,10 @@ _JIRA_AUTH_CLIENT_ID=""
 _JIRA_AUTH_CLIENT_SECRET=""
 _JIRA_AUTH_ACCESS_TOKEN=""
 _JIRA_AUTH_EXPIRES_AT=0
-# Path of the OIDC token file in OIDC mode. A path, not the token.
-_JIRA_AUTH_OIDC_TOKEN_FILE=""
+# The token broker's fd number in OIDC mode. A number, not the token.
+_JIRA_AUTH_OIDC_FD=""
+# Seconds to wait for the broker's answer to one request.
+_JIRA_AUTH_OIDC_TIMEOUT=20
 
 # Print the argument with surrounding whitespace removed.
 _jira_auth_trim() {
@@ -861,20 +868,21 @@ jira_auth_email() {
 # Select the credential mode and set JIRA_AUTH_MODE:
 #   token  — a token is set (the email decides Basic or Bearer per call)
 #   client — the client ID and secret are both set and no token is
-#   oidc   — the OIDC token file path is set, and no token or client
-#            variable is
+#   oidc   — the token broker fd is set, and no token or client variable
+#            is
 #   none   — nothing is set
-# The client ID and secret, and the OIDC token file path, are passed as
+# The client ID and secret, and the broker fd number, are passed as
 # variable names, never values, so a traced call line shows only the
-# names; they are read with xtrace off. The path variable defaults to
-# FULLSEND_JIRA_OIDC_TOKEN_FILE. Fails, naming the variables but never
-# their values, when more than one mode is set (the token file also counts
+# names; they are read with xtrace off. The fd variable defaults to
+# FULLSEND_JIRA_OIDC_TOKEN_FD. Fails, naming the variables but never their
+# values, when more than one mode is set (the broker fd also counts
 # FULLSEND_JIRA_TOKEN from the environment), only one client variable is,
-# or a name is not a shell identifier. Values are trimmed, so one that is
-# only whitespace counts as unset. The file itself is checked on each call.
+# the fd is not a number from 3 up, or a name is not a shell identifier.
+# Values are trimmed, so one that is only whitespace counts as unset.
+# Whether the fd is open is checked on each call.
 #
 # Usage: jira_auth_select <token> <client-id-var> <client-secret-var>
-#          [<oidc-token-file-var>]
+#          [<oidc-token-fd-var>]
 jira_auth_select() {
   local _jas_xtrace=0 _jas_rc=0
   if [[ $- == *x* ]]; then
@@ -891,7 +899,7 @@ jira_auth_select() {
 # Locals use a _jas_ prefix, and such names are refused, so the indirect
 # reads see the caller's variables, not these.
 _jira_auth_select_now() {
-  local _jas_oidc_var="${4:-FULLSEND_JIRA_OIDC_TOKEN_FILE}"
+  local _jas_oidc_var="${4:-FULLSEND_JIRA_OIDC_TOKEN_FD}"
   local _jas_name
   for _jas_name in "$2" "$3"; do
     if [[ ! "${_jas_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ || "${_jas_name}" == _jas_* ]]; then
@@ -900,21 +908,25 @@ _jira_auth_select_now() {
     fi
   done
   if [[ ! "${_jas_oidc_var}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ || "${_jas_oidc_var}" == _jas_* ]]; then
-    echo "ERROR: jira_auth_select needs the name of the OIDC token file variable" >&2
+    echo "ERROR: jira_auth_select needs the name of the OIDC token fd variable" >&2
     return 1
   fi
-  local _jas_token _jas_id _jas_secret _jas_oidc_file
+  local _jas_token _jas_id _jas_secret _jas_oidc_fd
   _jas_token="$(_jira_auth_trim "$1")"
   _jas_id="$(_jira_auth_trim "${!2:-}")"
   _jas_secret="$(_jira_auth_trim "${!3:-}")"
-  _jas_oidc_file="$(_jira_auth_trim "${!_jas_oidc_var:-}")"
-  if [[ -n "${_jas_oidc_file}" ]]; then
+  _jas_oidc_fd="$(_jira_auth_trim "${!_jas_oidc_var:-}")"
+  if [[ -n "${_jas_oidc_fd}" ]]; then
     if [[ -n "${_jas_token}" || -n "$(_jira_auth_trim "${FULLSEND_JIRA_TOKEN:-}")" ]]; then
-      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FILE (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN), not both" >&2
+      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN), not both" >&2
       return 1
     fi
     if [[ -n "${_jas_id}" || -n "${_jas_secret}" ]]; then
-      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FILE (tracker.jira.auth: oidc) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not both" >&2
+      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not both" >&2
+      return 1
+    fi
+    if [[ ! "${_jas_oidc_fd}" =~ ^[0-9]{1,4}$ ]] || (( 10#${_jas_oidc_fd} < 3 )); then
+      echo "ERROR: FULLSEND_JIRA_OIDC_TOKEN_FD must be a file descriptor number from 3 up" >&2
       return 1
     fi
   fi
@@ -928,10 +940,10 @@ _jira_auth_select_now() {
   fi
   _JIRA_AUTH_ACCESS_TOKEN=""
   _JIRA_AUTH_EXPIRES_AT=0
-  _JIRA_AUTH_OIDC_TOKEN_FILE=""
-  if [[ -n "${_jas_oidc_file}" ]]; then
+  _JIRA_AUTH_OIDC_FD=""
+  if [[ -n "${_jas_oidc_fd}" ]]; then
     JIRA_AUTH_MODE="oidc"
-    _JIRA_AUTH_OIDC_TOKEN_FILE="${_jas_oidc_file}"
+    _JIRA_AUTH_OIDC_FD="$((10#${_jas_oidc_fd}))"
   elif [[ -n "${_jas_token}" ]]; then
     JIRA_AUTH_MODE="token"
   elif [[ -n "${_jas_id}" ]]; then
@@ -966,32 +978,41 @@ jira_auth_require_api_url() {
 
 # The OIDC token is meant for the self-hosted Jira gateway only (its aud),
 # and the CI token must never reach Atlassian. Fail unless JIRA_API_URL is
-# set, is https, and its host (after any user info, without the port, case
-# and trailing dots ignored) is not atlassian.com, atlassian.net or a
-# subdomain of either. Prints no URL.
+# set and is https, its authority has no user info, percent-encoding or
+# backslash, its port (if any) is digits, its host matches fullsend's rule
+# for a lowercase DNS name, and that host is not atlassian.com,
+# atlassian.net or a subdomain of either. Prints no URL.
 _jira_auth_check_gateway() {
   local url="${JIRA_API_URL:-}"
   if [[ -z "${url}" ]]; then
-    echo "ERROR: JIRA_API_URL (the Jira gateway URL from tracker.jira.api_url) must be set when FULLSEND_JIRA_OIDC_TOKEN_FILE is used" >&2
+    echo "ERROR: JIRA_API_URL (the Jira gateway URL from tracker.jira.api_url) must be set when FULLSEND_JIRA_OIDC_TOKEN_FD is used" >&2
     return 1
   fi
   if [[ "${url}" != https://* ]]; then
-    echo "ERROR: JIRA_API_URL must start with https:// when FULLSEND_JIRA_OIDC_TOKEN_FILE is used" >&2
+    echo "ERROR: JIRA_API_URL must start with https:// when FULLSEND_JIRA_OIDC_TOKEN_FD is used" >&2
     return 1
   fi
-  local host="${url#https://}"
-  host="${host%%[/?#]*}"
-  host="${host##*@}"
-  host="${host%%:*}"
-  host="$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')"
-  while [[ "${host}" == *. ]]; do
-    host="${host%.}"
-  done
-  case "${host}" in
-    "")
-      echo "ERROR: JIRA_API_URL has no host" >&2
+  local authority="${url#https://}"
+  authority="${authority%%[/?#]*}"
+  case "${authority}" in
+    *[@%\\]*)
+      echo "ERROR: JIRA_API_URL must not carry user info, percent-encoding or a backslash in its host" >&2
       return 1
       ;;
+  esac
+  local host="${authority}"
+  if [[ "${host}" == *:* ]]; then
+    if [[ ! "${host##*:}" =~ ^[0-9]{1,5}$ ]]; then
+      echo "ERROR: JIRA_API_URL has an invalid port" >&2
+      return 1
+    fi
+    host="${host%:*}"
+  fi
+  if [[ ! "${host}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; then
+    echo "ERROR: JIRA_API_URL host must be a lowercase DNS name" >&2
+    return 1
+  fi
+  case "${host}" in
     atlassian.com | *.atlassian.com | atlassian.net | *.atlassian.net)
       echo "ERROR: JIRA_API_URL points at an Atlassian host; the OIDC token is sent only to a self-hosted Jira gateway" >&2
       return 1
@@ -999,32 +1020,102 @@ _jira_auth_check_gateway() {
   esac
 }
 
-# Fail unless the OIDC token file is present, readable and non-empty.
-# Errors name the variable, not the path.
-_jira_auth_oidc_check_file() {
-  local f="${_JIRA_AUTH_OIDC_TOKEN_FILE}"
-  if [[ ! -e "${f}" ]]; then
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FILE file is missing; fullsend run keeps it only while the script runs" >&2
-    return 1
-  fi
-  if [[ ! -f "${f}" || ! -r "${f}" ]]; then
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FILE file is not a readable file" >&2
-    return 1
-  fi
-  if [[ ! -s "${f}" ]]; then
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FILE file is empty" >&2
+# Fail unless the token broker fd is open in this process.
+_jira_auth_oidc_fd_open() {
+  if [[ -z "${_JIRA_AUTH_OIDC_FD}" ]] || ! { : >&"${_JIRA_AUTH_OIDC_FD}"; } 2>/dev/null; then
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker is not open in this process" >&2
     return 1
   fi
 }
 
-# Run curl against the gateway with the OIDC token as Bearer. Called by
-# jira_auth_curl with xtrace off. The token is read from the file now, for
-# this call only (fullsend run replaces the file atomically on refresh),
-# into a local that is cleared after curl. The Authorization header goes
-# in a curl config read from a process substitution (printf is a builtin),
-# so the token is in no argv; curl -q ignores curl config files and --proto
-# =https pins the scheme. Every URL argument must lie under JIRA_API_URL.
-# A 401 fails with its own message, and nothing is retried.
+# Close the token broker fd and unset FULLSEND_JIRA_OIDC_TOKEN_FD in the
+# current shell. Children that run agent-controlled or third-party code
+# (git and its hooks, pre-commit and its installs, gitleaks, gh) must not
+# hold the fd, so call this before starting them; to keep the fd for later
+# Jira calls, call it in a subshell: ( jira_auth_drop_oidc_fd; gh ... ).
+# The close goes through eval because bash before 4.1 has no {var}<&- form
+# for a fd number held in a variable. A no-op when no fd is set.
+jira_auth_drop_oidc_fd() {
+  local fd
+  for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
+    if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
+      eval "exec $((10#${fd}))<&-"
+    fi
+  done
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  _JIRA_AUTH_OIDC_FD=""
+}
+
+# Ask the broker for one token and store it in the caller's local "tok".
+# Called with xtrace off, by _jira_auth_oidc_curl only. Sends the request
+# ("token", or "refresh" to force a refetch, which the broker may answer
+# with the current token),
+# reads one line within _JIRA_AUTH_OIDC_TIMEOUT seconds, and requires
+# "ok <jwt>". The answer line is never printed.
+_jira_auth_oidc_fetch() {
+  _jira_auth_oidc_fd_open || return 1
+  local fd="${_JIRA_AUTH_OIDC_FD}" line="" rc=0 code
+  if ! { printf '%s\n' "$1" >&"${fd}"; } 2>/dev/null; then
+    echo "ERROR: could not send a request to the FULLSEND_JIRA_OIDC_TOKEN_FD token broker" >&2
+    return 1
+  fi
+  IFS= read -r -t "${_JIRA_AUTH_OIDC_TIMEOUT}" line <&"${fd}" || rc=$?
+  if (( rc > 128 )); then
+    line=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s" >&2
+    return 1
+  fi
+  if (( rc != 0 )); then
+    line=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed without an answer" >&2
+    return 1
+  fi
+  case "${line}" in
+    "ok "*)
+      tok="${line#ok }"
+      line=""
+      ;;
+    "err "*)
+      code="${line#err }"
+      line=""
+      if [[ -z "${code}" || "${code}" == *[!a-z_]* || ${#code} -gt 32 ]]; then
+        echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent a malformed error" >&2
+      else
+        echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker could not supply a token (err ${code})" >&2
+      fi
+      return 1
+      ;;
+    *)
+      line=""
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent an unexpected answer" >&2
+      return 1
+      ;;
+  esac
+  # A JWT is three non-empty base64url parts. Checking the shape also keeps
+  # the value safe inside the curl config line that carries it. Pattern
+  # expansion, not =~, so BASH_REMATCH never holds the token.
+  if [[ -z "${tok}" || -n "${tok//[A-Za-z0-9_.-]/}" || "${tok//[^.]/}" != ".." \
+    || "${tok}" == .* || "${tok}" == *. || "${tok}" == *..* ]]; then
+    tok=""
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not send a JWT" >&2
+    return 1
+  fi
+}
+
+# Run curl against the gateway with a broker token as Bearer. Called by
+# jira_auth_curl with xtrace off. Refuses, before asking the broker, a URL
+# argument outside JIRA_API_URL and curl options that would print the
+# request headers, read another config, write the headers elsewhere,
+# follow redirects or change the default scheme. The token is fetched for
+# this call only, into a local cleared after curl. curl runs without the
+# broker fd. The Authorization header goes in a curl config read from a
+# process substitution (printf is a builtin), so the token is in no argv;
+# curl -q ignores curl config files and --proto =https pins the scheme.
+# On a 401 the call asks the broker to refresh and is sent once more with
+# the answer; a second 401 fails with its own message. Each attempt's
+# output goes to a private file and only the last attempt's reaches the
+# caller, so a caller that parses curl's output sees one response. A body
+# read from stdin is refused, since a retry could not send it again.
 _jira_auth_oidc_curl() {
   _jira_auth_check_gateway || return 1
   local api="${JIRA_API_URL}"
@@ -1033,40 +1124,62 @@ _jira_auth_oidc_curl() {
   done
   local arg
   for arg in "$@"; do
+    case "${arg}" in
+      -v | --verbose | --trace | --trace-* | --stderr | -K | --config | -D | --dump-header \
+        | -L | --location | --location-* | --proto-default)
+        echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
+        return 1
+        ;;
+    esac
+    if [[ "${arg}" =~ ^-[A-Za-z]+$ && "${arg}" == *[vKDL]* ]]; then
+      echo "ERROR: curl option ${arg} is not allowed with the OIDC token" >&2
+      return 1
+    fi
     if [[ "${arg}" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// && "${arg}" != "${api}/"* ]]; then
       echo "ERROR: refusing to send the OIDC token to a URL outside JIRA_API_URL" >&2
       return 1
     fi
+    if [[ "${arg}" == "@-" ]]; then
+      echo "ERROR: a request body from stdin is not allowed with the OIDC token" >&2
+      return 1
+    fi
   done
-  _jira_auth_oidc_check_file || return 1
-  local tok=""
-  if ! { IFS= read -r tok || [[ -n "${tok}" ]]; } 2>/dev/null < "${_JIRA_AUTH_OIDC_TOKEN_FILE}"; then
-    echo "ERROR: could not read the FULLSEND_JIRA_OIDC_TOKEN_FILE file" >&2
-    return 1
-  fi
-  tok="$(_jira_auth_trim "${tok}")"
-  # A JWT is three non-empty base64url parts. Checking the shape also keeps
-  # the value safe inside the curl config line that carries it. Pattern
-  # expansion, not =~, so BASH_REMATCH never holds the token.
-  if [[ -z "${tok}" || -n "${tok//[A-Za-z0-9_.-]/}" || "${tok//[^.]/}" != ".." \
-    || "${tok}" == .* || "${tok}" == *. || "${tok}" == *..* ]]; then
+  local tok="" request="token" attempt rc hdr out code
+  for attempt in 1 2; do
+    _jira_auth_oidc_fetch "${request}" || {
+      tok=""
+      return 1
+    }
+    rc=0
+    hdr=""
+    if ! hdr="$(mktemp)" || ! out="$(mktemp)"; then
+      tok=""
+      rm -f "${hdr}"
+      return 1
+    fi
+    (
+      eval "exec ${_JIRA_AUTH_OIDC_FD}<&-"
+      exec curl -q --proto =https \
+        --config <(printf 'header = "Authorization: Bearer %s"\n' "${tok}") \
+        --dump-header "${hdr}" "$@"
+    ) > "${out}" || rc=$?
     tok=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FILE file does not hold a JWT" >&2
-    return 1
-  fi
-  local hdr rc=0 code
-  hdr="$(mktemp)" || { tok=""; return 1; }
-  curl -q --proto =https \
-    --config <(printf 'header = "Authorization: Bearer %s"\n' "${tok}") \
-    --dump-header "${hdr}" "$@" || rc=$?
-  tok=""
-  code="$(sed -n 's|^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*|\1|p' "${hdr}" | tail -n 1)"
-  rm -f "${hdr}"
-  if [[ "${code}" == "401" ]]; then
-    echo "ERROR: the Jira gateway answered HTTP 401: OIDC token refused or expired. Not retrying with another credential." >&2
-    return 1
-  fi
-  return "${rc}"
+    code="$(sed -n 's|^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*|\1|p' "${hdr}" | tail -n 1)"
+    rm -f "${hdr}"
+    if [[ "${code}" == "401" && "${attempt}" -eq 1 ]]; then
+      rm -f "${out}"
+      echo "WARNING: the Jira gateway answered HTTP 401; asking the token broker to refresh and retrying once" >&2
+      request="refresh"
+      continue
+    fi
+    cat "${out}"
+    rm -f "${out}"
+    if [[ "${code}" == "401" ]]; then
+      echo "ERROR: the Jira gateway answered HTTP 401 again after a refresh: OIDC token refused or expired. Not retrying with another credential." >&2
+      return 1
+    fi
+    return "${rc}"
+  done
 }
 
 # In client-credentials mode, make sure a usable access token is held:
@@ -1153,9 +1266,9 @@ _jira_auth_mint_now() {
 # Run curl with the Authorization for the selected mode, followed by the
 # caller's arguments. In client-credentials mode the token and email
 # arguments are ignored and the minted access token is sent as Bearer. In
-# OIDC mode they are ignored too, and the token read from the OIDC token
-# file goes to the gateway (see _jira_auth_oidc_curl). Otherwise fails without calling curl when
-# the token is empty.
+# OIDC mode they are ignored too, and a token from the broker goes to the
+# gateway (see _jira_auth_oidc_curl). Otherwise fails without calling curl
+# when the token is empty.
 #
 # Usage: jira_auth_curl <token> <email> [curl args...]
 jira_auth_curl() {
@@ -1197,12 +1310,12 @@ jira_auth_curl() {
 # the CLI cannot pick Basic auth. In client-credentials mode the CLI gets
 # FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, with
 # FULLSEND_JIRA_TOKEN and FULLSEND_JIRA_EMAIL removed, and mints for
-# itself, with xtrace off. In OIDC mode the CLI gets
-# FULLSEND_JIRA_OIDC_TOKEN_FILE, with the token, email and client
-# variables removed, once the file passes the same check as for REST
-# calls; the CLI reads the token from the file and the gateway from
-# tracker.jira.api_url. The values go through the environment, never the
-# command line.
+# itself, with xtrace off. In OIDC mode the CLI inherits the broker fd and
+# gets its number in FULLSEND_JIRA_OIDC_TOKEN_FD, with the token, email
+# and client variables removed, once the fd is open and JIRA_API_URL passes
+# the same gateway check as REST calls; it asks the broker itself and
+# reads the gateway from tracker.jira.api_url. The values go through the
+# environment, never the command line.
 #
 # Usage: jira_auth_fullsend <fullsend-bin> <token> <email> [cli args...]
 jira_auth_fullsend() {
@@ -1217,10 +1330,10 @@ jira_auth_fullsend() {
       xtrace=1
       set +x
     fi
-    if _jira_auth_oidc_check_file; then
+    if _jira_auth_check_gateway && _jira_auth_oidc_fd_open; then
       (
         unset FULLSEND_JIRA_TOKEN FULLSEND_JIRA_EMAIL FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
-        FULLSEND_JIRA_OIDC_TOKEN_FILE="${_JIRA_AUTH_OIDC_TOKEN_FILE}" "${bin}" "$@"
+        FULLSEND_JIRA_OIDC_TOKEN_FD="${_JIRA_AUTH_OIDC_FD}" "${bin}" "$@"
       ) || rc=$?
     else
       rc=1
@@ -1262,7 +1375,7 @@ jira_auth_fullsend() {
 # END bundled: lib/jira-auth.lib.sh
 jira_auth_select "${JIRA_TOKEN:-}" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET || exit 1
 if [[ "${JIRA_AUTH_MODE}" == "none" ]]; then
-  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FILE" >&2
+  echo "ERROR: JIRA_TOKEN must be set, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FD" >&2
   exit 1
 fi
 : "${JIRA_BASE_URL:?JIRA_BASE_URL must be set}"
