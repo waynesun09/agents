@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # jira-auth-test.sh — Tests for scripts/lib/jira-auth.lib.sh (agents#1926).
 #
-# Covers the four credential cases: token + email (Basic), token only
+# Covers the five credential cases: token + email (Basic), token only
 # (Bearer), OAuth 2.0 client credentials (minted Bearer token, fake curl and
-# fake fullsend on PATH), and conflicting settings. In client-credentials
+# fake fullsend on PATH), the CI OIDC token file whose token is sent to a
+# self-hosted gateway, and conflicting settings. In client-credentials
 # mode, asserts the client secret is in no curl or fullsend argv and in no
-# stdout or stderr.
+# stdout or stderr; in OIDC mode, the same for the OIDC token.
 #
 # Run from the repo root:
 #   bash scripts/jira-auth-test.sh
@@ -20,7 +21,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Tests set exactly the Jira credentials they need.
 unset FULLSEND_JIRA_TOKEN FULLSEND_JIRA_EMAIL FULLSEND_JIRA_CLIENT_ID \
-  FULLSEND_JIRA_CLIENT_SECRET JIRA_TOKEN JIRA_USER_EMAIL JIRA_API_URL
+  FULLSEND_JIRA_CLIENT_SECRET FULLSEND_JIRA_OIDC_TOKEN_FILE JIRA_TOKEN \
+  JIRA_USER_EMAIL JIRA_API_URL
 LIB="${SCRIPT_DIR}/lib/jira-auth.lib.sh"
 
 TMPDIR_ROOT="$(mktemp -d)"
@@ -32,21 +34,42 @@ mkdir -p "${MOCK_BIN}"
 SECRET='sec"ret\value-DO-NOT-LEAK'
 CLIENT_ID="client-id-123"
 API_URL="https://api.atlassian.com/ex/jira/cloud-1"
+# Two JWT-shaped OIDC tokens (the file before and after a refresh) and a
+# self-hosted gateway for the OIDC cases.
+OIDC_TOKEN="test-header.test-payload.oidc-sig-one-DO-NOT-LEAK"
+OIDC_TOKEN_2="test-header.test-payload.oidc-sig-two-DO-NOT-LEAK"
+GATEWAY_URL="https://jira-gw.example.com/ex/jira/cloud-1"
 
 # Fake curl: logs its argv, logs stdin when the body is read from stdin,
-# and answers the Atlassian token endpoint (body + "\n<status>", as
-# --write-out produces). Other calls print a fixed body.
+# logs the content of a --config file, writes a status line to a
+# --dump-header file (FAKE_GATEWAY_STATUS, default 200), and answers the
+# Atlassian token endpoint (body + "\n<status>", as --write-out produces).
+# Other calls print a fixed body.
 cat > "${MOCK_BIN}/curl" <<'MOCKEOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LOG_DIR}/curl-argv.log"
 url=""
 stdin_body=0
+config=""
+dump=""
+prev=""
 for arg in "$@"; do
+  case "${prev}" in
+    --config) config="${arg}" ;;
+    --dump-header) dump="${arg}" ;;
+  esac
+  prev="${arg}"
   case "${arg}" in
     https://*) url="${arg}" ;;
     @-) stdin_body=1 ;;
   esac
 done
+if [[ -n "${config}" ]]; then
+  cat "${config}" >> "${LOG_DIR}/curl-config.log"
+fi
+if [[ -n "${dump}" ]]; then
+  printf 'HTTP/2 %s\r\ncontent-type: application/json\r\n\r\n' "${FAKE_GATEWAY_STATUS:-200}" > "${dump}"
+fi
 if [[ "${stdin_body}" -eq 1 ]]; then
   cat >> "${LOG_DIR}/curl-stdin.log"
   printf '\n' >> "${LOG_DIR}/curl-stdin.log"
@@ -83,6 +106,8 @@ fi
 printf 'token=%s email=%s id=%s secret=%s\n' "${FULLSEND_JIRA_TOKEN-unset}" \
   "${FULLSEND_JIRA_EMAIL-unset}" "${FULLSEND_JIRA_CLIENT_ID-unset}" "${secret_state}" \
   >> "${LOG_DIR}/fullsend-env.log"
+printf 'oidc-file=%s oidc-token=%s\n' "${FULLSEND_JIRA_OIDC_TOKEN_FILE-unset}" \
+  "${FULLSEND_JIRA_OIDC_TOKEN:+set}" >> "${LOG_DIR}/fullsend-oidc.log"
 MOCKEOF
 chmod +x "${MOCK_BIN}/fullsend"
 
@@ -107,9 +132,12 @@ run_case() {
   CASE_RC=0
   env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL -u FULLSEND_JIRA_CLIENT_ID \
     -u FULLSEND_JIRA_CLIENT_SECRET -u JIRA_TOKEN -u JIRA_USER_EMAIL -u JIRA_API_URL \
+    -u FULLSEND_JIRA_OIDC_TOKEN_FILE \
     PATH="${MOCK_BIN}:${PATH}" LOG_DIR="${CASE_DIR}" EXPECTED_SECRET="${SECRET}" \
     TEST_SECRET="${SECRET}" TEST_CLIENT_ID="${CLIENT_ID}" TEST_API_URL="${API_URL}" \
+    TEST_OIDC="${OIDC_TOKEN}" TEST_OIDC_2="${OIDC_TOKEN_2}" TEST_GATEWAY="${GATEWAY_URL}" \
     FAKE_MINT="${FAKE_MINT:-ok}" FAKE_EXPIRES_IN="${FAKE_EXPIRES_IN:-3600}" \
+    FAKE_GATEWAY_STATUS="${FAKE_GATEWAY_STATUS:-200}" \
     bash -c "set -euo pipefail; source '${LIB}'; ${body}" \
     2> "${CASE_ERR}" | cat > "${CASE_OUT}" || CASE_RC=$?
 }
@@ -464,6 +492,238 @@ for conflict in "both|tok-4|${CLIENT_ID}|${SECRET}" "token-and-id|tok-4|${CLIENT
   fi
   assert_secret_hidden "conflict-${cname}"
 done
+
+# --- Case 5: CI OIDC token file, token sent to a self-hosted Jira gateway ---
+
+# Assert neither OIDC token is in any argv of a curl or fullsend call or in
+# the case's stdout or stderr. The curl config log is where the token
+# belongs, so it is not checked.
+assert_oidc_hidden() {
+  local name="$1"
+  local f
+  for f in "${CASE_DIR}/curl-argv.log" "${CASE_DIR}/fullsend-argv.log" "${CASE_OUT}" "${CASE_ERR}"; do
+    [[ -f "${f}" ]] || continue
+    if grep -qF -e "${OIDC_TOKEN}" -e "${OIDC_TOKEN_2}" "${f}"; then
+      fail "${name}-oidc-token-hidden" "OIDC token found in $(basename "${f}")"
+      return
+    fi
+  done
+  pass "${name}-oidc-token-hidden"
+}
+
+# Body prefix: write the first token to a 0600 file under the case
+# directory and point FULLSEND_JIRA_OIDC_TOKEN_FILE at it.
+OIDC_SETUP='
+  umask 077
+  printf "%s\n" "${TEST_OIDC}" > "${LOG_DIR}/oidc-token"
+  export FULLSEND_JIRA_OIDC_TOKEN_FILE="${LOG_DIR}/oidc-token"
+'
+
+# The file is read on every call: replacing it between two calls (an
+# atomic rename, as fullsend run refreshes it) makes the second call send
+# the new token, and no shell variable keeps either token afterwards.
+run_case oidc "${OIDC_SETUP}"'
+  export JIRA_API_URL="${TEST_GATEWAY}/" FULLSEND_JIRA_EMAIL=inherited@example.com
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  echo "mode=${JIRA_AUTH_MODE}"
+  jira_auth_require_api_url
+  jira_auth_mint
+  # Both calls run in this shell, not a command substitution, so a value
+  # kept from the first call would still be there for the second.
+  jira_auth_curl "" "bot@example.com" "${TEST_GATEWAY}/rest/api/3/myself" > "${LOG_DIR}/captured"
+  echo "captured=$(cat "${LOG_DIR}/captured")"
+  printf "%s\n" "${TEST_OIDC_2}" > "${LOG_DIR}/oidc-token.new"
+  mv -f "${LOG_DIR}/oidc-token.new" "${LOG_DIR}/oidc-token"
+  jira_auth_curl "" "" "${TEST_GATEWAY}/rest/api/3/issue/X-1" >/dev/null
+  printf "body" | jira_auth_fullsend fullsend "" "" issues post-comment --result -
+  : reset-underscore
+  if ( set -o posix; set ) | grep -v "^TEST_OIDC" | grep -qF -e "${TEST_OIDC}" -e "${TEST_OIDC_2}"; then
+    echo "cached=yes"
+  else
+    echo "cached=no"
+  fi
+'
+if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "mode=oidc" "${CASE_OUT}" \
+  && grep -qx 'captured={"ok":true}' "${CASE_OUT}"; then
+  pass "oidc-selects-oidc-mode"
+else
+  fail "oidc-selects-oidc-mode" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+if [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 2 ]] \
+  && [[ "$(grep -c -- "^-q --proto =https --config .* ${GATEWAY_URL}/rest/api/3/" "${CASE_DIR}/curl-argv.log")" -eq 2 ]] \
+  && ! grep -qE -- "--user|--oauth2-bearer|auth.atlassian.com" "${CASE_DIR}/curl-argv.log" \
+  && [[ ! -f "${CASE_DIR}/mint-count" ]]; then
+  pass "oidc-sends-bearer-to-gateway-via-config"
+else
+  fail "oidc-sends-bearer-to-gateway-via-config" "$(cat "${CASE_DIR}/curl-argv.log" 2>/dev/null)"
+fi
+if [[ "$(sed -n 1p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN}\"" ]] \
+  && [[ "$(sed -n 2p "${CASE_DIR}/curl-config.log")" == "header = \"Authorization: Bearer ${OIDC_TOKEN_2}\"" ]]; then
+  pass "oidc-reads-token-file-on-each-call"
+else
+  fail "oidc-reads-token-file-on-each-call" "the second call did not send the refreshed token"
+fi
+if grep -qx "cached=no" "${CASE_OUT}"; then
+  pass "oidc-token-not-kept-in-shell-variables"
+else
+  fail "oidc-token-not-kept-in-shell-variables" "a shell variable still holds an OIDC token"
+fi
+if grep -qx "token=unset email=unset id=unset secret=unset" "${CASE_DIR}/fullsend-env.log" \
+  && grep -qx "oidc-file=${CASE_DIR}/oidc-token oidc-token=" "${CASE_DIR}/fullsend-oidc.log"; then
+  pass "oidc-fullsend-gets-token-file-only"
+else
+  fail "oidc-fullsend-gets-token-file-only" "$(cat "${CASE_DIR}/fullsend-env.log" "${CASE_DIR}/fullsend-oidc.log" 2>/dev/null)"
+fi
+assert_oidc_hidden "oidc"
+
+# xtrace on through select, curl and the fullsend call: no trace line
+# carries the token.
+run_case oidc-xtrace "${OIDC_SETUP}"'
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  set -x
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself" >/dev/null
+  printf "body" | jira_auth_fullsend fullsend "" "" issues get
+  set +x
+'
+if [[ "${CASE_RC}" -eq 0 ]] && grep -q "^+* jira_auth_curl " "${CASE_ERR}" \
+  && [[ -s "${CASE_DIR}/curl-config.log" && -s "${CASE_DIR}/fullsend-oidc.log" ]]; then
+  pass "oidc-xtrace-runs"
+else
+  fail "oidc-xtrace-runs" "rc=${CASE_RC}"
+fi
+assert_oidc_hidden "oidc-xtrace"
+
+# A saved copy of the path under another name (as post-code.sh passes it)
+# selects OIDC.
+run_case oidc-named "${OIDC_SETUP}"'
+  saved_file="${FULLSEND_JIRA_OIDC_TOKEN_FILE}"
+  unset FULLSEND_JIRA_OIDC_TOKEN_FILE
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET saved_file
+  echo "mode=${JIRA_AUTH_MODE}"
+  jira_auth_fullsend fullsend "" "" issues get
+'
+if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "mode=oidc" "${CASE_OUT}" \
+  && grep -qx "oidc-file=${CASE_DIR}/oidc-token oidc-token=" "${CASE_DIR}/fullsend-oidc.log"; then
+  pass "oidc-named-variable"
+else
+  fail "oidc-named-variable" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+
+# The token file next to a token or client credentials fails, naming the
+# variables and never the values, before any call.
+for conflict in "token-arg" "token-env" "client-pair" "client-id-only"; do
+  case "${conflict}" in
+    token-arg) setup='jira_auth_select "tok-5" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET' ;;
+    token-env) setup='export FULLSEND_JIRA_TOKEN=tok-5; jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET' ;;
+    client-pair) setup='jira_auth_select "" TEST_CLIENT_ID TEST_SECRET' ;;
+    client-id-only) setup='jira_auth_select "" TEST_CLIENT_ID UNSET_SECRET' ;;
+  esac
+  run_case "oidc-conflict-${conflict}" "${OIDC_SETUP}
+    export JIRA_API_URL=\"\${TEST_GATEWAY}\"
+    ${setup}
+    jira_auth_curl '' '' \"\${TEST_GATEWAY}/rest/api/3/myself\"
+  "
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE" "${CASE_ERR}" \
+    && grep -qE "FULLSEND_JIRA_TOKEN|FULLSEND_JIRA_CLIENT_ID" "${CASE_ERR}" \
+    && ! grep -qF "tok-5" "${CASE_ERR}" && ! grep -qF "${CLIENT_ID}" "${CASE_ERR}" \
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+    pass "oidc-conflict-${conflict}-fails"
+  else
+    fail "oidc-conflict-${conflict}-fails" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+  fi
+  assert_oidc_hidden "oidc-conflict-${conflict}"
+  assert_secret_hidden "oidc-conflict-${conflict}"
+done
+
+# A missing, empty or unreadable file, or one that holds no JWT, fails the
+# REST call and the CLI call with a clear error and calls neither. A
+# directory stands in for an unreadable file, since root can read a 0000
+# file; the 0000 case runs only when not root.
+file_cases="missing empty directory not-jwt"
+[[ "$(id -u)" -ne 0 ]] && file_cases="${file_cases} mode-0000"
+for fcase in ${file_cases}; do
+  case "${fcase}" in
+    missing) fsetup='rm -f "${LOG_DIR}/oidc-token"'; want="file is missing" ;;
+    empty) fsetup=': > "${LOG_DIR}/oidc-token"'; want="file is empty" ;;
+    directory) fsetup='rm -f "${LOG_DIR}/oidc-token"; mkdir "${LOG_DIR}/oidc-token"'; want="not a readable file" ;;
+    not-jwt) fsetup='printf "not-a-jwt-DO-NOT-LEAK\n" > "${LOG_DIR}/oidc-token"'; want="does not hold a JWT" ;;
+    mode-0000) fsetup='chmod 000 "${LOG_DIR}/oidc-token"'; want="not a readable file" ;;
+  esac
+  run_case "oidc-file-${fcase}" "${OIDC_SETUP}
+    export JIRA_API_URL=\"\${TEST_GATEWAY}\"
+    jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+    ${fsetup}
+    if jira_auth_curl '' '' \"\${TEST_GATEWAY}/rest/api/3/myself\"; then echo curl=ok; else echo curl=refused; fi
+    if jira_auth_fullsend fullsend '' '' issues get; then echo cli=ok; else echo cli=refused; fi
+  "
+  cli_want="cli=refused"
+  # The CLI reads the token itself; the library checks only that the file
+  # is there, readable and non-empty.
+  [[ "${fcase}" == "not-jwt" ]] && cli_want="cli=ok"
+  if [[ "${CASE_RC}" -eq 0 ]] && grep -qx "curl=refused" "${CASE_OUT}" && grep -qx "${cli_want}" "${CASE_OUT}" \
+    && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE file" "${CASE_ERR}" && grep -qF "${want}" "${CASE_ERR}" \
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]] \
+    && ! grep -qF "DO-NOT-LEAK" "${CASE_OUT}" "${CASE_ERR}"; then
+    pass "oidc-file-${fcase}-refused"
+  else
+    fail "oidc-file-${fcase}-refused" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+  fi
+done
+
+# The CI token never goes to Atlassian or over plain http, and an unset
+# JIRA_API_URL has no fallback: both the up-front check and the call refuse.
+for api in "unset" "https://api.atlassian.com/ex/jira/cloud-1" "https://site.atlassian.net" \
+  "https://API.Atlassian.COM./ex/jira/cloud-1" "https://gw.example.com@api.atlassian.com/ex/jira/c" \
+  "https://jira.atlassian.com:443/x" "http://jira-gw.example.com/ex/jira/cloud-1"; do
+  api_setup="export JIRA_API_URL='${api}'"
+  [[ "${api}" == "unset" ]] && api_setup="export JIRA_BASE_URL=https://site.atlassian.net"
+  run_case "oidc-api-url" "${OIDC_SETUP}
+    ${api_setup}
+    jira_auth_select '' FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+    if jira_auth_require_api_url; then echo require=ok; else echo require=refused; fi
+    jira_auth_curl '' '' \"\${JIRA_API_URL:-\${JIRA_BASE_URL}}/rest/api/3/myself\"
+  "
+  if [[ "${CASE_RC}" -ne 0 ]] && grep -qx "require=refused" "${CASE_OUT}" \
+    && grep -qF "JIRA_API_URL" "${CASE_ERR}" \
+    && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+    pass "oidc-refuses-api-url-'${api}'"
+  else
+    fail "oidc-refuses-api-url-'${api}'" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+  fi
+  assert_oidc_hidden "oidc-api-url"
+  rm -rf "${CASE_DIR}"
+done
+
+# A URL argument outside JIRA_API_URL is refused, even with a good gateway.
+run_case oidc-other-url "${OIDC_SETUP}"'
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" "https://site.atlassian.net/rest/api/3/myself"
+'
+if [[ "${CASE_RC}" -ne 0 ]] && grep -qF "outside JIRA_API_URL" "${CASE_ERR}" \
+  && [[ ! -f "${CASE_DIR}/curl-argv.log" ]]; then
+  pass "oidc-refuses-url-outside-api-url"
+else
+  fail "oidc-refuses-url-outside-api-url" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+
+# A 401 from the gateway fails with its own message, once: no retry, no
+# mint, no other credential.
+FAKE_GATEWAY_STATUS=401 run_case oidc-401 "${OIDC_SETUP}"'
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  jira_auth_curl "" "" --fail --silent "${JIRA_API_URL}/rest/api/3/myself"
+'
+if [[ "${CASE_RC}" -ne 0 ]] \
+  && grep -qF "HTTP 401: OIDC token refused or expired. Not retrying with another credential." "${CASE_ERR}" \
+  && [[ "$(wc -l < "${CASE_DIR}/curl-argv.log")" -eq 1 ]] \
+  && [[ ! -f "${CASE_DIR}/mint-count" ]]; then
+  pass "oidc-401-fails-without-retry"
+else
+  fail "oidc-401-fails-without-retry" "rc=${CASE_RC}; $(cat "${CASE_ERR}")"
+fi
+assert_oidc_hidden "oidc-401"
 
 echo ""
 if [ ${FAILURES} -gt 0 ]; then

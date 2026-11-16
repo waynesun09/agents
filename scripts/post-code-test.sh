@@ -3731,7 +3731,7 @@ for arg in "\$@"; do
   fi
   PREV="\${arg}"
 done
-echo "fullsend \$* env-token=\${FULLSEND_JIRA_TOKEN:-unset} env-email=\${FULLSEND_JIRA_EMAIL-unset} env-client-id=\${FULLSEND_JIRA_CLIENT_ID-unset} env-client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} <<BODY:\${BODY}:BODY>>" >> "${JIRA_INT_FULLSEND_LOG}"
+echo "fullsend \$* env-token=\${FULLSEND_JIRA_TOKEN:-unset} env-email=\${FULLSEND_JIRA_EMAIL-unset} env-client-id=\${FULLSEND_JIRA_CLIENT_ID-unset} env-client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} env-oidc-file=\${FULLSEND_JIRA_OIDC_TOKEN_FILE-unset} <<BODY:\${BODY}:BODY>>" >> "${JIRA_INT_FULLSEND_LOG}"
 if [[ -n "\${MOCK_FULLSEND_FAIL:-}" ]]; then
   echo "Error: Jira API returned 401" >&2
   exit 1
@@ -3743,7 +3743,7 @@ chmod +x "${JIRA_INT_MOCK_BIN}/fullsend"
 # hooks (it runs repo-controlled code in the real tool).
 cat > "${JIRA_INT_MOCK_BIN}/pre-commit" <<MOCKEOF
 #!/usr/bin/env bash
-echo "pre-commit jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set}" >> "${JIRA_INT_PRECOMMIT_LOG}"
+echo "pre-commit jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FILE:+set}" >> "${JIRA_INT_PRECOMMIT_LOG}"
 exit 0
 MOCKEOF
 chmod +x "${JIRA_INT_MOCK_BIN}/pre-commit"
@@ -3792,11 +3792,11 @@ cat > /dev/null
 read -r _ _ _ gp _ < "/proc/\${PPID}/stat"
 leak=no
 for pid in "\${PPID}" "\${gp}"; do
-  if tr '\\0' '\\n' < "/proc/\${pid}/environ" 2>/dev/null | grep -qE '^(JIRA_TOKEN|JIRA_USER_EMAIL|FULLSEND_JIRA_TOKEN|FULLSEND_JIRA_EMAIL|FULLSEND_JIRA_CLIENT_ID|FULLSEND_JIRA_CLIENT_SECRET)=.'; then
+  if tr '\\0' '\\n' < "/proc/\${pid}/environ" 2>/dev/null | grep -qE '^(JIRA_TOKEN|JIRA_USER_EMAIL|FULLSEND_JIRA_TOKEN|FULLSEND_JIRA_EMAIL|FULLSEND_JIRA_CLIENT_ID|FULLSEND_JIRA_CLIENT_SECRET|FULLSEND_JIRA_OIDC_TOKEN_FILE)=.'; then
     leak=yes
   fi
 done
-echo "${hook_name} jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} proc-environ-leak=\${leak} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set}" >> "${log_path}"
+echo "${hook_name} jira-token=\${JIRA_TOKEN:-unset} jira-email=\${JIRA_USER_EMAIL:-unset} fullsend-token=\${FULLSEND_JIRA_TOKEN:-unset} fullsend-email=\${FULLSEND_JIRA_EMAIL:-unset} proc-environ-leak=\${leak} client-id=\${FULLSEND_JIRA_CLIENT_ID:-unset} client-secret=\${FULLSEND_JIRA_CLIENT_SECRET:+set} oidc=\${FULLSEND_JIRA_OIDC_TOKEN_FILE:+set}" >> "${log_path}"
 exit 0
 HOOKEOF
   chmod +x "${hook_path}"
@@ -4106,6 +4106,57 @@ for _jira_conflict_case in "both|JIRA_TOKEN=fake-jira-token" "id-only|FULLSEND_J
     echo "PASS: jira-client-conflict-${_jira_conflict_name}-fails-step (expected failure, got exit ${JIRA_INT_RC})"
   fi
 done
+
+# CI OIDC token file (tracker.jira.auth: oidc): with no token or client
+# credentials, the stage update runs the CLI with FULLSEND_JIRA_OIDC_TOKEN_FILE
+# only. Hooks never see the path, in their environment or their parents'
+# /proc environ, and the token reaches no output or command line.
+JIRA_OIDC_VALUE="test-header.test-payload.post-code-oidc-DO-NOT-LEAK"
+JIRA_OIDC_FILE="${JIRA_INT_TMPDIR}/oidc-token"
+(umask 077 && printf '%s\n' "${JIRA_OIDC_VALUE}" > "${JIRA_OIDC_FILE}")
+JIRA_OIDC_ENV=(JIRA_TOKEN= FULLSEND_JIRA_TOKEN= JIRA_USER_EMAIL= FULLSEND_JIRA_EMAIL=
+  "FULLSEND_JIRA_OIDC_TOKEN_FILE=${JIRA_OIDC_FILE}")
+: > "${JIRA_INT_PRECOMMIT_LOG}"
+: > "${JIRA_INT_PREPUSH_LOG}"
+JIRA_INT_WITH_PRECOMMIT=1 JIRA_INT_PREPUSH_HOOK="${JIRA_INT_PREPUSH_LOG}" \
+  run_jira_int "jira-oidc" github "${JIRA_OIDC_ENV[@]}"
+if [ "${JIRA_INT_RC}" -ne 0 ]; then
+  jira_int_fail "jira-oidc-stage-update" "post-code failed"
+elif ! grep -qF "env-token=unset env-email=unset env-client-id=unset env-client-secret= env-oidc-file=${JIRA_OIDC_FILE} " "${JIRA_INT_FULLSEND_LOG}" \
+     || ! grep -qF -- "${JIRA_CODE_MARKER}" "${JIRA_INT_FULLSEND_LOG}"; then
+  jira_int_fail "jira-oidc-stage-update" "the CLI did not get the OIDC token file alone"
+elif ! grep -qF "client-secret= oidc=" "${JIRA_INT_PRECOMMIT_LOG}" \
+     || grep -qF "oidc=set" "${JIRA_INT_PRECOMMIT_LOG}" \
+     || ! grep -qF "proc-environ-leak=no client-id=unset client-secret= oidc=" "${JIRA_INT_PREPUSH_LOG}" \
+     || grep -qF "oidc=set" "${JIRA_INT_PREPUSH_LOG}"; then
+  jira_int_fail "jira-oidc-stage-update" "OIDC token file path visible to pre-commit or a pre-push hook"
+elif grep -qF "${JIRA_OIDC_VALUE}" "${JIRA_INT_OUT}" "${JIRA_INT_FULLSEND_LOG}" "${JIRA_INT_FORGE_LOG}"; then
+  jira_int_fail "jira-oidc-stage-update" "OIDC token in output or on a command line"
+else
+  echo "PASS: jira-oidc-stage-update"
+fi
+
+# The OIDC token file next to a token fails the Jira write without the CLI.
+run_jira_int "jira-oidc-conflict" github "${JIRA_OIDC_ENV[@]}" JIRA_TOKEN=fake-jira-token
+if [ "${JIRA_INT_RC}" -eq 0 ]; then
+  jira_int_fail "jira-oidc-conflict-fails-step" "expected failure but got success"
+elif ! grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE" "${JIRA_INT_OUT}" || [ -s "${JIRA_INT_FULLSEND_LOG}" ] \
+     || grep -qF "${JIRA_OIDC_VALUE}" "${JIRA_INT_OUT}"; then
+  jira_int_fail "jira-oidc-conflict-fails-step" "missing error naming the variables, a write was attempted, or the token was printed"
+else
+  echo "PASS: jira-oidc-conflict-fails-step (expected failure, got exit ${JIRA_INT_RC})"
+fi
+
+# A token file that is gone by the time of the write fails it without the CLI.
+run_jira_int "jira-oidc-missing-file" github "${JIRA_OIDC_ENV[@]}" \
+  "FULLSEND_JIRA_OIDC_TOKEN_FILE=${JIRA_INT_TMPDIR}/no-such-oidc-token"
+if [ "${JIRA_INT_RC}" -eq 0 ]; then
+  jira_int_fail "jira-oidc-missing-file-fails-step" "expected failure but got success"
+elif ! grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FILE file is missing" "${JIRA_INT_OUT}" || [ -s "${JIRA_INT_FULLSEND_LOG}" ]; then
+  jira_int_fail "jira-oidc-missing-file-fails-step" "missing token-file error, or a write was attempted"
+else
+  echo "PASS: jira-oidc-missing-file-fails-step (expected failure, got exit ${JIRA_INT_RC})"
+fi
 
 # The config-backed CLI needs FULLSEND_DIR for tracker.jira.
 run_jira_int "jira-missing-fullsend-dir" github FULLSEND_DIR=

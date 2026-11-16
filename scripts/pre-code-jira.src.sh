@@ -26,6 +26,10 @@
 #   FULLSEND_JIRA_CLIENT_ID, FULLSEND_JIRA_CLIENT_SECRET
 #                      — service-account OAuth 2.0 client credentials,
 #                         instead of JIRA_TOKEN (needs JIRA_API_URL)
+#   FULLSEND_JIRA_OIDC_TOKEN_FILE
+#                      — file holding a CI OIDC token for a self-hosted
+#                         Jira gateway (tracker.jira.auth: oidc), instead
+#                         of both; sent only to JIRA_API_URL
 #   GH_TOKEN / GITLAB_TOKEN — target forge token for the existing-PR check;
 #                         the check is skipped when unset
 #   COMMENT_BODY       — trigger comment; when unset, read from the dispatch
@@ -121,7 +125,7 @@ JIRA_CREDS_OK=0
 # Test the credentials with xtrace off so the secret is not traced.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 _jira_creds_set=0
-[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]] && _jira_creds_set=1
+[[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FILE:-}" ]] && _jira_creds_set=1
 (( _jira_xtrace_was_on )) && set -x
 unset _jira_xtrace_was_on
 if (( _jira_creds_set )); then

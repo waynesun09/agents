@@ -116,6 +116,11 @@ check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_DIR '${FULLSEND_DIR}'
 # their own names, so jira-auth.lib.sh and the fullsend CLI read them.
 check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_CLIENT_ID '${FULLSEND_JIRA_CLIENT_ID}'
 check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_CLIENT_SECRET '${FULLSEND_JIRA_CLIENT_SECRET}'
+# The file holding a CI OIDC token for a self-hosted Jira gateway
+# (tracker.jira.auth: oidc): fullsend run keeps it fresh for each pre/post
+# script only when env.runner declares the path, so it must be mapped
+# under its own name for jira-auth.lib.sh and the fullsend CLI.
+check_runner_mapping "${TRIAGE_HARNESS}" triage FULLSEND_JIRA_OIDC_TOKEN_FILE '${FULLSEND_JIRA_OIDC_TOKEN_FILE}'
 
 # The real FULLSEND_JIRA_* values (token, email, client ID and secret) must
 # never reach the sandbox, so no sandbox env, Jira host file or provider
@@ -129,8 +134,8 @@ for f in "${TRIAGE_HARNESS}" "${REPO_ROOT}/harness/code.yaml"; do
     assert_pass "${name}-no-fullsend-jira-in-sandbox"
   fi
   if yq -r '[(.env.sandbox // {}), (.overlays[]? | .env.sandbox // {}), (.forge[]? | .env.sandbox // {})] | .[] | to_entries | .[] | .key + "=" + .value' "${f}" \
-    | grep -qF 'FULLSEND_JIRA_CLIENT_'; then
-    assert_fail "${name}-no-jira-client-credentials-in-any-sandbox" "FULLSEND_JIRA_CLIENT_* referenced in an env.sandbox block"
+    | grep -qE 'FULLSEND_JIRA_(CLIENT_|OIDC_)'; then
+    assert_fail "${name}-no-jira-client-credentials-in-any-sandbox" "FULLSEND_JIRA_CLIENT_* or FULLSEND_JIRA_OIDC_* referenced in an env.sandbox block"
   else
     assert_pass "${name}-no-jira-client-credentials-in-any-sandbox"
   fi
@@ -144,7 +149,7 @@ for f in "${TRIAGE_HARNESS}" "${REPO_ROOT}/harness/code.yaml"; do
   leaked=""
   while IFS= read -r src; do
     [[ -n "${src}" && -f "${REPO_ROOT}/${src}" ]] || continue
-    if grep -qF 'FULLSEND_JIRA_CLIENT_' "${REPO_ROOT}/${src}"; then
+    if grep -qE 'FULLSEND_JIRA_(CLIENT_|OIDC_)' "${REPO_ROOT}/${src}"; then
       leaked="${leaked} ${src}"
     fi
   done <<< "${host_srcs}"
@@ -239,6 +244,32 @@ check_runner_mapping "${CODE_HARNESS}" code JIRA_USER_EMAIL '${FULLSEND_JIRA_EMA
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_DIR '${FULLSEND_DIR}'
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_CLIENT_ID '${FULLSEND_JIRA_CLIENT_ID}'
 check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_CLIENT_SECRET '${FULLSEND_JIRA_CLIENT_SECRET}'
+check_runner_mapping "${CODE_HARNESS}" code FULLSEND_JIRA_OIDC_TOKEN_FILE '${FULLSEND_JIRA_OIDC_TOKEN_FILE}'
+
+# The token file path is the only OIDC hand-off: no harness maps any other
+# FULLSEND_JIRA_OIDC_* name, or this one anywhere but env.runner of the
+# Jira overlay of code and triage. Every string in the file is listed with
+# its path, so a key or a value anywhere counts.
+for f in "${REPO_ROOT}"/harness/*.yaml; do
+  name="$(basename "${f}" .yaml)"
+  got="$(yq -r '.. | select(tag == "!!str") | (path | join(".")) + "=" + .' "${f}" \
+    | grep -F "FULLSEND_JIRA_OIDC" || true)"
+  ok=false
+  case "${name}" in
+    code | triage)
+      if [[ "${got}" =~ ^overlays\.([0-9]+)\.env\.runner\.FULLSEND_JIRA_OIDC_TOKEN_FILE=\$\{FULLSEND_JIRA_OIDC_TOKEN_FILE\}$ ]] \
+        && yq -r ".overlays[${BASH_REMATCH[1]}].when" "${f}" | grep -qF '"jira"'; then
+        ok=true
+      fi
+      ;;
+    *) [[ -z "${got}" ]] && ok=true ;;
+  esac
+  if ${ok}; then
+    assert_pass "${name}-only-oidc-token-file-mapping"
+  else
+    assert_fail "${name}-only-oidc-token-file-mapping" "got: ${got//$'\n'/; }"
+  fi
+done
 
 # JIRA_USER_EMAIL reaches the sandbox through the expanded host file, not
 # env.sandbox (optional for a service account; #1900).

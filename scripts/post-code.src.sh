@@ -35,7 +35,10 @@
 # optional: when set, the write uses bot-user Basic auth; when unset or
 # empty, service-account Bearer auth. FULLSEND_JIRA_CLIENT_ID and
 # FULLSEND_JIRA_CLIENT_SECRET can replace JIRA_TOKEN (service-account OAuth
-# 2.0 client credentials); setting both modes fails the Jira write. JIRA_BASE_URL is optional and
+# 2.0 client credentials), and FULLSEND_JIRA_OIDC_TOKEN_FILE can replace
+# both (the file holding a CI OIDC token for a self-hosted Jira gateway,
+# tracker.jira.auth: oidc); setting more than one mode fails the Jira
+# write. JIRA_BASE_URL is optional and
 # cross-checked against the work-item URL. GitLab targets take the GitLab
 # host from CI_SERVER_HOST.
 #
@@ -92,24 +95,28 @@ _jira_token_saved=""
 _jira_email_saved=""
 _jira_client_id_saved=""
 _jira_client_secret_saved=""
+_jira_oidc_token_file_saved=""
 # Keep credentials off the trace: xtrace off for the stash, restored after.
 _jira_xtrace_was_on=0; [[ $- == *x* ]] && _jira_xtrace_was_on=1; set +x
 if [[ -n "${_POST_CODE_JIRA_FD:-}" ]]; then
   _jira_stash_fd="${_POST_CODE_JIRA_FD}"
   unset _POST_CODE_JIRA_FD
   { IFS= read -r -d '' _jira_token_saved || true; IFS= read -r -d '' _jira_email_saved || true
-    IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true; } \
+    IFS= read -r -d '' _jira_client_id_saved || true; IFS= read -r -d '' _jira_client_secret_saved || true
+    IFS= read -r -d '' _jira_oidc_token_file_saved || true; } \
     < "/proc/self/fd/${_jira_stash_fd}"
   exec {_jira_stash_fd}<&-
   unset _jira_stash_fd
-elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
+elif [[ -n "${JIRA_TOKEN:-}${JIRA_USER_EMAIL:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_EMAIL:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}${FULLSEND_JIRA_OIDC_TOKEN_FILE:-}" ]]; then
   _jira_stash_file="$(mktemp)"
   exec {_jira_stash_fd}<>"${_jira_stash_file}"
   rm -f "${_jira_stash_file}"
-  printf '%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
-    "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" >&"${_jira_stash_fd}"
+  printf '%s\0%s\0%s\0%s\0%s\0' "${JIRA_TOKEN-}" "${JIRA_USER_EMAIL-}" \
+    "${FULLSEND_JIRA_CLIENT_ID-}" "${FULLSEND_JIRA_CLIENT_SECRET-}" \
+    "${FULLSEND_JIRA_OIDC_TOKEN_FILE-}" >&"${_jira_stash_fd}"
   exec env -u JIRA_TOKEN -u JIRA_USER_EMAIL -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_EMAIL \
     -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+    -u FULLSEND_JIRA_OIDC_TOKEN_FILE \
     _POST_CODE_JIRA_FD="${_jira_stash_fd}" "${BASH}" "${BASH_SOURCE[0]}" "$@"
 fi
 (( _jira_xtrace_was_on )) && set -x
@@ -562,12 +569,13 @@ post_jira_stage_update() {
   # uses service-account Bearer auth. Client credentials replace the token,
   # and the CLI mints its own access token from them.
   if ! jira_auth_select "${_jira_token_saved:-}" \
-    _jira_client_id_saved _jira_client_secret_saved; then
+    _jira_client_id_saved _jira_client_secret_saved \
+    _jira_oidc_token_file_saved; then
     gha_echo error "Conflicting Jira credentials; cannot write to Jira"
     return 1
   fi
   if [ "${JIRA_AUTH_MODE}" = "none" ]; then
-    gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET)"
+    gha_echo error "JIRA_TOKEN is required to write to Jira (or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, or FULLSEND_JIRA_OIDC_TOKEN_FILE)"
     return 1
   fi
   if [ -z "${FULLSEND_DIR:-}" ]; then
