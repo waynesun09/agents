@@ -1739,6 +1739,39 @@ test_log_doc_names_no_command_injection
 test_log_doc_names_nul_embedded_in_name
 test_scrub_note_pii_redacts_phone
 
+# Scribe has no Jira oidc support yet. A Jira token broker fd next to a
+# Jira token is a conflict whatever the tracker; alone on a Jira tracker
+# run it is refused when the Jira library loads. Either way the script
+# stops before any Jira call.
+SCRIBE_OIDC_DIR="$(mktemp -d)"
+printf 'ok test-header.test-payload.scribe-unused\n' > "${SCRIBE_OIDC_DIR}/answers"
+for scribe_case in "github-with-token" "jira-with-token" "jira-alone"; do
+  scribe_env=(FULLSEND_FORGE=github FULLSEND_TRACKER=github JIRA_TOKEN=fake-jira-token)
+  want="FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN)"
+  case "${scribe_case}" in
+    jira-with-token) scribe_env=(FULLSEND_FORGE=github FULLSEND_TRACKER=jira JIRA_TOKEN=fake-jira-token) ;;
+    jira-alone)
+      scribe_env=(FULLSEND_FORGE=github FULLSEND_TRACKER=jira)
+      want="scribe has no Jira oidc support yet"
+      ;;
+  esac
+  scribe_rc=0
+  env -u JIRA_TOKEN -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+    "${scribe_env[@]}" GH_TOKEN=fake-gh-token SCRIBE_REPO=test-org/test-repo SCRIBE_DRY_RUN=true \
+    JIRA_BASE_URL=https://test.atlassian.net SCRIBE_JIRA_PROJECT=PROJ FULLSEND_DIR="${SCRIBE_OIDC_DIR}" \
+    python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${SCRIBE_OIDC_DIR}/broker.log" \
+    "${SCRIBE_OIDC_DIR}/answers" -- bash "${PRE_SCRIPT}" > "${SCRIBE_OIDC_DIR}/out" 2>&1 || scribe_rc=$?
+  if [[ "${scribe_rc}" -ne 0 ]] && grep -qF -- "${want}" "${SCRIBE_OIDC_DIR}/out" \
+    && ! grep -q '^request ' "${SCRIBE_OIDC_DIR}/broker.log"; then
+    echo "PASS: pre-scribe-oidc-fd-${scribe_case}-refused"
+  else
+    echo "FAIL: pre-scribe-oidc-fd-${scribe_case}-refused — rc=${scribe_rc}"
+    cat "${SCRIBE_OIDC_DIR}/out"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+rm -rf "${SCRIBE_OIDC_DIR}"
+
 echo ""
 if [[ ${FAILURES} -gt 0 ]]; then
   echo "${FAILURES} test(s) failed"

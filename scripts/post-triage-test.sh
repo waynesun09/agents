@@ -24,6 +24,15 @@ MOCK_BIN="${TMPDIR}/bin"
 mkdir -p "${MOCK_BIN}"
 cat > "${MOCK_BIN}/gh" <<MOCKEOF
 #!/usr/bin/env bash
+# BROKER_PROBE_LOG: record whether gh still holds the token broker fd the
+# test's broker passed (TEST_BROKER_FD).
+if [[ -n "\${BROKER_PROBE_LOG:-}" && -n "\${TEST_BROKER_FD:-}" ]]; then
+  if { : >&"\${TEST_BROKER_FD}"; } 2>/dev/null; then
+    echo "gh fd=open var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" >> "\${BROKER_PROBE_LOG}"
+  else
+    echo "gh fd=closed var=\${FULLSEND_JIRA_OIDC_TOKEN_FD-unset}" >> "\${BROKER_PROBE_LOG}"
+  fi
+fi
 # When querying the repo labels list, return a set of known test labels so that
 # the label-existence guard in post-triage.sh allows them through.
 if [[ "\$1" == "api" ]] && [[ "\$2" == *"/labels" ]] && [[ "\$*" == *"--paginate"* ]] && [[ "\$*" != *"-f "* ]] && [[ "\$*" != *"-X "* ]]; then
@@ -3176,10 +3185,10 @@ unset JIRA_USER_EMAIL JIRA_TOKEN JIRA_DUPLICATE_TRANSITION JIRA_NOT_PLANNED_TRAN
 
 # --- Summary ---
 
-# oidc mode: post-triage closes a Jira token broker fd at its first action
-# and logs one notice; its Jira writes in oidc mode need core support
-# (follow-up). With no other Jira credential it then stops as it does
-# without credentials: non-zero exit, no Jira or CLI call, broker not asked.
+# oidc mode: post-triage closes a Jira token broker fd at its first action;
+# its Jira writes in oidc mode need core support (follow-up). With no other
+# Jira credential it stops with one error that names no variable to set:
+# exit 1, no Jira or CLI call, broker not asked.
 PT_OIDC_DIR="${TMPDIR}/run-jira-oidc-post-triage"
 mkdir -p "${PT_OIDC_DIR}/iteration-1/output"
 echo '{"action":"insufficient","reasoning":"missing repro","clarity_scores":{"symptom":0.6,"cause":0.3,"reproduction":0.1,"impact":0.5,"overall":0.39},"comment":"Could you share the steps?"}' \
@@ -3194,14 +3203,60 @@ pt_oidc_rc=0
   FULLSEND_DIR="${TMPDIR}/dot-fullsend" \
   python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${PT_OIDC_DIR}/broker.log" "${PT_OIDC_DIR}/broker-answers" -- \
   bash "${POST_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_oidc_rc=$?
-if [[ "${pt_oidc_rc}" -ne 0 ]] \
-  && [[ "$(grep -c "Jira updates from post-triage are not available in oidc mode yet" "${TMPDIR}/stdout.log")" -eq 1 ]] \
+if [[ "${pt_oidc_rc}" -eq 1 ]] \
+  && [[ "$(grep -cxF "ERROR: post-triage: Jira updates in oidc mode need fullsend core support that is not available yet; triage made no Jira changes" "${TMPDIR}/stdout.log")" -eq 1 ]] \
+  && [[ "$(wc -l < "${TMPDIR}/stdout.log")" -eq 1 ]] \
+  && ! grep -qE "JIRA_TOKEN|FULLSEND_JIRA_CLIENT|FULLSEND_JIRA_OIDC_TOKEN_FD|not available in oidc mode yet" "${TMPDIR}/stdout.log" \
   && [[ ! -s "${JIRA_CURL_LOG}" && ! -s "${GH_LOG}" ]] \
   && ! grep -q '^request ' "${PT_OIDC_DIR}/broker.log"; then
-  echo "PASS: jira-oidc-post-triage-notice-and-no-jira-writes"
+  echo "PASS: jira-oidc-post-triage-one-error-and-no-jira-writes"
 else
-  echo "FAIL: jira-oidc-post-triage-notice-and-no-jira-writes — rc=${pt_oidc_rc}"
+  echo "FAIL: jira-oidc-post-triage-one-error-and-no-jira-writes — rc=${pt_oidc_rc}"
   cat "${TMPDIR}/stdout.log" "${JIRA_CURL_LOG}" "${GH_LOG}"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# A broker fd next to a token is a conflict: one error, exit 1, before any
+# Jira call; the token is not used instead.
+: > "${JIRA_CURL_LOG}"
+: > "${GH_LOG}"
+pt_conflict_rc=0
+(cd "${PT_OIDC_DIR}" && env -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+  -u GH_TOKEN -u CI_SERVER_HOST -u JIRA_API_URL FULLSEND_TRACKER=jira FULLSEND_FORGE=jira \
+  ISSUE_URL="https://test.atlassian.net/browse/TESTPROJ-42" JIRA_USER_EMAIL="triage@example.com" \
+  JIRA_TOKEN="fake-jira-token" FULLSEND_DIR="${TMPDIR}/dot-fullsend" \
+  python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${PT_OIDC_DIR}/broker.log" "${PT_OIDC_DIR}/broker-answers" -- \
+  bash "${POST_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_conflict_rc=$?
+if [[ "${pt_conflict_rc}" -eq 1 ]] \
+  && grep -qF "FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN)" "${TMPDIR}/stdout.log" \
+  && ! grep -qF "fake-jira-token" "${TMPDIR}/stdout.log" \
+  && [[ ! -s "${JIRA_CURL_LOG}" && ! -s "${GH_LOG}" ]]; then
+  echo "PASS: jira-oidc-post-triage-fd-and-token-conflict"
+else
+  echo "FAIL: jira-oidc-post-triage-fd-and-token-conflict — rc=${pt_conflict_rc}"
+  cat "${TMPDIR}/stdout.log" "${JIRA_CURL_LOG}" "${GH_LOG}"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# On a run whose tracker is not Jira, a broker fd is closed at the first
+# action and post-triage carries on: none of its children (gh here) holds
+# the fd or the variable. Removing the close makes this fail.
+PT_PROBE_LOG="${TMPDIR}/broker-probe.log"
+: > "${PT_PROBE_LOG}"
+: > "${GH_LOG}"
+pt_probe_rc=0
+(cd "${PT_OIDC_DIR}" && env -u JIRA_TOKEN -u FULLSEND_JIRA_TOKEN -u FULLSEND_JIRA_CLIENT_ID -u FULLSEND_JIRA_CLIENT_SECRET \
+  -u FULLSEND_WORK_ITEM_SOURCE FULLSEND_TRACKER=github FULLSEND_FORGE=github \
+  ISSUE_URL="https://github.com/test-org/test-repo/issues/42" GH_TOKEN="fake-gh-token" \
+  BROKER_PROBE_LOG="${PT_PROBE_LOG}" \
+  python3 -I "${SCRIPT_DIR}/test-fixtures/jira-oidc-broker.py" "${PT_OIDC_DIR}/broker.log" "${PT_OIDC_DIR}/broker-answers" -- \
+  bash "${POST_SCRIPT}") > "${TMPDIR}/stdout.log" 2>&1 || pt_probe_rc=$?
+if [[ "${pt_probe_rc}" -eq 0 && -s "${PT_PROBE_LOG}" ]] \
+  && [[ "$(sort -u "${PT_PROBE_LOG}")" == "gh fd=closed var=unset" ]]; then
+  echo "PASS: jira-oidc-post-triage-children-without-broker-fd"
+else
+  echo "FAIL: jira-oidc-post-triage-children-without-broker-fd — rc=${pt_probe_rc}"
+  cat "${TMPDIR}/stdout.log" "${PT_PROBE_LOG}"
   FAILURES=$((FAILURES + 1))
 fi
 

@@ -598,21 +598,31 @@ post_jira_stage_update() {
   fi
   # A core that sets it posts the comment after this script exits: hand
   # it the verb and the PR/MR URL, and use no Jira credential, connection
-  # setting or CLI here.
+  # setting or CLI here. The line is written with printf, no external
+  # binary (PATH may have changed since the start), from a verb in the
+  # fixed set and a URL whose strict shape leaves nothing to escape in JSON.
   if [ -n "${_jira_stage_result_saved}" ]; then
-    local result_verb="pushed"
-    if [ "${verb}" = "opened" ]; then
-      result_verb="opened"
+    local result_verb
+    case "${verb}" in
+      "opened") result_verb="opened" ;;
+      "pushed new commits to") result_verb="pushed" ;;
+      *)
+        gha_echo error "Unexpected code-stage update for the Jira stage result"
+        return 1
+        ;;
+    esac
+    if [[ ! "${pr_url}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]+/(pull|-/merge_requests)/[1-9][0-9]*$ ]]; then
+      gha_echo error "The PR/MR URL is not in the expected shape for the Jira stage result"
+      return 1
     fi
-    if ! jq -cn --arg verb "${result_verb}" --arg url "${pr_url}" '{verb: $verb, url: $url}' \
-      > "${_jira_stage_result_saved}"; then
+    if ! printf '{"verb":"%s","url":"%s"}\n' "${result_verb}" "${pr_url}" > "${_jira_stage_result_saved}"; then
       gha_echo error "Could not write the Jira stage result for fullsend"
       return 1
     fi
     return 0
   fi
-  # A core that does not set it: post the comment here. The credentials were withheld
-  # from the environment at the start of the script (see "Jira credential
+  # A core that does not set it: post the comment here. The credentials
+  # were withheld from the environment at the start of the script (see "Jira credential
   # isolation"); they are passed to the trusted CLI below and nowhere else.
   # The email is optional: without it the CLI uses service-account Bearer
   # auth. Client credentials replace the token, and the CLI mints its own

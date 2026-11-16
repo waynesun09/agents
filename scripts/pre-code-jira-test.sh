@@ -23,6 +23,7 @@ PRESCRIPT_OUT="${TMPDIR}/prescript.out"
 FULLSEND_CALLS="${TMPDIR}/fullsend-calls.log"
 CURL_ARGV_LOG="${TMPDIR}/curl-argv.log"
 CHILD_FD_LOG="${TMPDIR}/child-fds.log"
+REAL_JQ="$(command -v jq)"
 BROKER_LOG="${TMPDIR}/broker.log"
 PAYLOAD_DIR="${TMPDIR}/fullsend-dir/dispatch"
 
@@ -117,6 +118,15 @@ exit "${MOCK_FULLSEND_EXIT:-0}"
 FSEOF
   chmod +x "${mock_bin}/fullsend"
 
+  # jq wrapper: records whether it holds the token broker fd, then runs the
+  # real jq.
+  cat > "${mock_bin}/jq" <<'JQEOF'
+#!/usr/bin/env bash
+echo "jq var=${FULLSEND_JIRA_OIDC_TOKEN_FD-unset} fd=$([ -n "${TEST_BROKER_FD:-}" ] && { : >&"${TEST_BROKER_FD}"; } 2>/dev/null && echo open || echo closed)" >> "${CHILD_FD_LOG:-/dev/null}"
+exec "${REAL_JQ}" "$@"
+JQEOF
+  chmod +x "${mock_bin}/jq"
+
   # Mock git (needed for pre-commit tool resolution)
   cat > "${mock_bin}/git" <<'GITEOF'
 #!/usr/bin/env bash
@@ -160,6 +170,7 @@ base_env() {
   echo "FULLSEND_CALLS=${FULLSEND_CALLS}"
   echo "CURL_ARGV_LOG=${CURL_ARGV_LOG}"
   echo "CHILD_FD_LOG=${CHILD_FD_LOG}"
+  echo "REAL_JQ=${REAL_JQ}"
   echo "COMMENT_BODY="
   echo "CODE_FORCE="
 }
@@ -660,7 +671,8 @@ RUN_BROKER="ok ${OIDC_TOKEN_VALUE}" run_skip_test "oidc-run-proceeds" \
   "MOCK_PY_MANIFEST={\"tools\":[{\"name\":\"t\"}]}
 ${OIDC_ENV}"
 oidc_children_ok=true
-for child in gh git python3 install; do
+# jq covers the _jira_no_broker call sites (the child-check request body).
+for child in gh git python3 install jq; do
   grep -qx "${child} var=unset fd=closed" "${CHILD_FD_LOG}" || oidc_children_ok=false
 done
 if ${oidc_children_ok} && ! grep -qv " var=unset fd=closed$" "${CHILD_FD_LOG}" \

@@ -26,6 +26,10 @@
 #   FULLSEND_JIRA_CLIENT_ID, FULLSEND_JIRA_CLIENT_SECRET
 #                      — service-account OAuth 2.0 client credentials,
 #                         instead of JIRA_TOKEN (needs JIRA_API_URL)
+#   FULLSEND_JIRA_OIDC_TOKEN_FD
+#                      — fd of the CI OIDC token broker (tracker.jira.auth:
+#                         oidc), instead of both; the token goes only to
+#                         JIRA_API_URL, a self-hosted Jira gateway
 #   GH_TOKEN / GITLAB_TOKEN — target forge token for the existing-PR check;
 #                         the check is skipped when unset
 #   COMMENT_BODY       — trigger comment; when unset, read from the dispatch
@@ -36,16 +40,20 @@
 set -euo pipefail
 
 # The Jira token broker fd (FULLSEND_JIRA_OIDC_TOKEN_FD, tracker.jira.auth:
-# oidc) is only for the Jira calls below. Every other child runs without it:
-# helpers that only run in a command substitution close it first, other
-# commands go through _jira_no_broker, and it is closed for good once the
-# last Jira call is done, before anything touches the target repository.
+# oidc) is only for the Jira calls below. Every child runs without it except
+# the runner utilities the Jira helpers start while a call is in progress
+# (tr, mktemp, sed, tail, rm, cat) and the curl and fullsend
+# calls themselves: helpers that only run in a command substitution close it
+# first, other commands go through _jira_no_broker, and it is closed for
+# good once the last Jira call is done, before any target-repo access.
 _jira_close_broker() {
-  local fd="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
-  fd="${fd//[[:space:]]/}"
-  if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
-    eval "exec $((10#${fd}))<&-"
-  fi
+  local fd
+  for fd in "${_JIRA_AUTH_OIDC_FD:-}" "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"; do
+    fd="${fd//[[:space:]]/}"
+    if [[ "${fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${fd} >= 3 )); then
+      eval "exec $((10#${fd}))<&-"
+    fi
+  done
   unset FULLSEND_JIRA_OIDC_TOKEN_FD
   # shellcheck disable=SC2034 # read by jira-auth.lib.sh
   _JIRA_AUTH_OIDC_FD=""
@@ -58,7 +66,7 @@ _jira_no_broker() {
   )
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(_jira_close_broker; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/prescript-output.lib.sh
 source "${SCRIPT_DIR}/lib/prescript-output.lib.sh"
 
@@ -254,7 +262,7 @@ _jira_list_human_prs() {
 _jira_child_count() {
   local resp
   resp="$(_jira_api POST "/search/jql" \
-    --data "$(jq -cn --arg jql "parent = ${ISSUE_KEY} AND issuetype not in subTaskIssueTypes()" '{jql: $jql, maxResults: 1, fields: ["key"]}')" 2>/dev/null)" \
+    --data "$(_jira_no_broker jq -cn --arg jql "parent = ${ISSUE_KEY} AND issuetype not in subTaskIssueTypes()" '{jql: $jql, maxResults: 1, fields: ["key"]}')" 2>/dev/null)" \
     || return 1
   _jira_close_broker  # the Jira call is done; this runs in a substitution
   printf '%s' "${resp}" | jq -er '.issues | length' 2>/dev/null

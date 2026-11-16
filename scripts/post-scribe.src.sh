@@ -29,6 +29,27 @@
 
 set -euo pipefail
 
+# Scribe has no Jira oidc support yet. Should a harness pass a Jira token
+# broker fd, close it and unset the variable before anything else runs,
+# whatever the tracker. Next to another Jira credential it is a conflict;
+# alone, _SCRIBE_JIRA_OIDC_FD_SEEN makes jira-scribe-ops.lib.sh refuse a
+# Jira tracker run.
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  if [[ -n "${_jira_broker_fd}" ]]; then
+    if [[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
+      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" >&2
+      exit 1
+    fi
+    _SCRIBE_JIRA_OIDC_FD_SEEN=1
+  fi
+  unset _jira_broker_fd
+fi
+
 : "${FULLSEND_FORGE:?FULLSEND_FORGE must be set}"
 
 # shellcheck disable=SC2034 # SCRIPT_DIR used by source in .src.sh; unused in bundled .sh

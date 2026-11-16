@@ -30,6 +30,27 @@
 
 set -euo pipefail
 
+# Scribe has no Jira oidc support yet. Should a harness pass a Jira token
+# broker fd, close it and unset the variable before anything else runs,
+# whatever the tracker. Next to another Jira credential it is a conflict;
+# alone, _SCRIBE_JIRA_OIDC_FD_SEEN makes jira-scribe-ops.lib.sh refuse a
+# Jira tracker run.
+if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
+  _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
+  if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
+    eval "exec $((10#${_jira_broker_fd}))<&-"
+  fi
+  unset FULLSEND_JIRA_OIDC_TOKEN_FD
+  if [[ -n "${_jira_broker_fd}" ]]; then
+    if [[ -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
+      echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" >&2
+      exit 1
+    fi
+    _SCRIBE_JIRA_OIDC_FD_SEEN=1
+  fi
+  unset _jira_broker_fd
+fi
+
 : "${FULLSEND_FORGE:?FULLSEND_FORGE must be set}"
 
 # shellcheck disable=SC2034 # SCRIPT_DIR used by source in .src.sh; unused in bundled .sh
@@ -740,6 +761,10 @@ case "${FULLSEND_TRACKER}" in
 # --tracker jira --fullsend-dir` (fullsend#7083 / fullsend#9078). The post-script
 # validates this at preflight time via tracker_validate_create.
 #
+# Scribe has no Jira oidc support yet: a token broker fd
+# (FULLSEND_JIRA_OIDC_TOKEN_FD) is refused here. pre-scribe and post-scribe
+# close one before anything else runs and set _SCRIBE_JIRA_OIDC_FD_SEEN.
+#
 # Expected env vars:
 #   JIRA_BASE_URL          — Jira Cloud base URL (https://<site>.atlassian.net)
 #   JIRA_TOKEN             — Jira API token. Or, instead of it:
@@ -748,10 +773,6 @@ case "${FULLSEND_TRACKER}" in
 #                            REST calls then use an access token minted on
 #                            the runner and need JIRA_API_URL. Setting both
 #                            modes fails.
-#
-# Scribe has no Jira oidc support yet: a token broker fd
-# (FULLSEND_JIRA_OIDC_TOKEN_FD) is refused here, and pre-scribe closes one
-# before anything else runs.
 #   FULLSEND_DIR           — .fullsend directory whose config.yaml holds
 #                            tracker.jira, for `fullsend issues create`
 #   SCRIBE_JIRA_PROJECT    — Jira project key that backlog reads and new
@@ -928,6 +949,12 @@ _jira_auth_select_now() {
       echo "ERROR: FULLSEND_JIRA_OIDC_TOKEN_FD must be a file descriptor number from 3 up" >&2
       return 1
     fi
+    # The out-of-step check (_jira_auth_oidc_check_pending) needs read -t 0,
+    # which bash 4 added. Fail closed on an older bash.
+    if (( BASH_VERSINFO[0] < 4 )); then
+      echo "ERROR: FULLSEND_JIRA_OIDC_TOKEN_FD needs bash 4 or later" >&2
+      return 1
+    fi
   fi
   if [[ -n "${_jas_token}" && ( -n "${_jas_id}" || -n "${_jas_secret}" ) ]]; then
     echo "ERROR: set either FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not both" >&2
@@ -1058,6 +1085,20 @@ jira_auth_drop_oidc_fd() {
   _JIRA_AUTH_OIDC_FD=""
 }
 
+# Fail when data is waiting on the broker fd before a request: it is a late
+# answer to an earlier request (for example one that timed out in a command
+# substitution, which closed only that subshell's copy of the fd), so the
+# stream is out of step. Close the fd and fail. read -t 0 needs bash 4 or
+# later; jira_auth_select refuses the broker fd on an older bash.
+_jira_auth_oidc_check_pending() {
+  local fd="${_JIRA_AUTH_OIDC_FD}"
+  if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    jira_auth_drop_oidc_fd
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    return 1
+  fi
+}
+
 # Ask the broker for one token and store it in the caller's local "tok".
 # Called with xtrace off, by _jira_auth_oidc_curl only. Sends the request
 # ("token", or "refresh" to force a refetch, which the broker may answer
@@ -1066,16 +1107,8 @@ jira_auth_drop_oidc_fd() {
 # "ok <jwt>". The answer line is never printed.
 _jira_auth_oidc_fetch() {
   _jira_auth_oidc_fd_open || return 1
+  _jira_auth_oidc_check_pending || return 1
   local fd="${_JIRA_AUTH_OIDC_FD}" line="" rc=0 code
-  # Data waiting before a request is a late answer to an earlier one (for
-  # example one that timed out in a command substitution, which closed only
-  # that subshell's copy): the stream is out of step. Close it and fail.
-  if read -r -t 0 <&"${fd}" 2>/dev/null; then
-    eval "exec ${fd}<&-"
-    _JIRA_AUTH_OIDC_FD=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
-    return 1
-  fi
   if ! { printf '%s\n' "$1" >&"${fd}"; } 2>/dev/null; then
     echo "ERROR: could not send a request to the FULLSEND_JIRA_OIDC_TOKEN_FD token broker" >&2
     return 1
@@ -1085,14 +1118,17 @@ _jira_auth_oidc_fetch() {
     # A late answer would be read as the reply to the next request, so the
     # broker is not asked again: close the fd.
     line=""
-    eval "exec ${fd}<&-"
-    _JIRA_AUTH_OIDC_FD=""
+    jira_auth_drop_oidc_fd
     echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s; closing it" >&2
     return 1
   fi
   if (( rc != 0 )); then
+    if [[ -z "${line}" ]]; then
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
+    else
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent an incomplete answer" >&2
+    fi
     line=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed without an answer" >&2
     return 1
   fi
   case "${line}" in
@@ -1219,7 +1255,7 @@ _jira_auth_oidc_curl() {
       return 1
     fi
     (
-      eval "exec ${_JIRA_AUTH_OIDC_FD}<&-"
+      jira_auth_drop_oidc_fd
       exec curl -q --proto =https \
         --config <(printf 'header = "Authorization: Bearer %s"\n' "${tok}") \
         --dump-header "${hdr}" "$@"
@@ -1391,7 +1427,7 @@ jira_auth_fullsend() {
       xtrace=1
       set +x
     fi
-    if _jira_auth_check_gateway && _jira_auth_oidc_fd_open; then
+    if _jira_auth_check_gateway && _jira_auth_oidc_fd_open && _jira_auth_oidc_check_pending; then
       (
         unset FULLSEND_JIRA_TOKEN FULLSEND_JIRA_EMAIL FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
         FULLSEND_JIRA_OIDC_TOKEN_FD="${_JIRA_AUTH_OIDC_FD}" "${bin}" "$@"
@@ -1435,7 +1471,7 @@ jira_auth_fullsend() {
 }
 # END bundled: lib/jira-auth.lib.sh
 _scribe_jira_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
-if [[ -n "${_scribe_jira_fd//[[:space:]]/}" ]]; then
+if [[ -n "${_scribe_jira_fd//[[:space:]]/}" || -n "${_SCRIBE_JIRA_OIDC_FD_SEEN:-}" ]]; then
   echo "ERROR: scribe has no Jira oidc support yet; set JIRA_TOKEN, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET" >&2
   exit 1
 fi

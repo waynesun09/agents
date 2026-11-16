@@ -25,15 +25,24 @@ set -euo pipefail
 
 # post-triage Jira writes in oidc mode need core support (follow-up). Close a
 # Jira token broker fd (FULLSEND_JIRA_OIDC_TOKEN_FD) before anything else
-# runs, and say so when it is the only Jira credential.
+# runs. Next to another Jira credential it is a conflict, as everywhere
+# else. When it is the only Jira credential of a Jira run, stop with one
+# error: nothing here can write to Jira yet.
 if [[ -n "${FULLSEND_JIRA_OIDC_TOKEN_FD:-}" ]]; then
   _jira_broker_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD//[[:space:]]/}"
   if [[ "${_jira_broker_fd}" =~ ^[0-9]{1,4}$ ]] && (( 10#${_jira_broker_fd} >= 3 )); then
     eval "exec $((10#${_jira_broker_fd}))<&-"
   fi
   unset FULLSEND_JIRA_OIDC_TOKEN_FD
-  if [[ -n "${_jira_broker_fd}" && -z "${JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
-    echo "::notice::Jira updates from post-triage are not available in oidc mode yet"
+  if [[ -n "${_jira_broker_fd}" \
+    && -n "${JIRA_TOKEN:-}${FULLSEND_JIRA_TOKEN:-}${FULLSEND_JIRA_CLIENT_ID:-}${FULLSEND_JIRA_CLIENT_SECRET:-}" ]]; then
+    echo "ERROR: set either FULLSEND_JIRA_OIDC_TOKEN_FD (tracker.jira.auth: oidc) or FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not more than one" >&2
+    exit 1
+  fi
+  if [[ -n "${_jira_broker_fd}" ]] \
+    && [[ "${FULLSEND_WORK_ITEM_SOURCE:-}" == "jira" || "${FULLSEND_TRACKER:-}" == "jira" ]]; then
+    echo "ERROR: post-triage: Jira updates in oidc mode need fullsend core support that is not available yet; triage made no Jira changes" >&2
+    exit 1
   fi
   unset _jira_broker_fd
 fi

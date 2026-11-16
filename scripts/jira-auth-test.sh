@@ -720,7 +720,7 @@ done
 # an fd that is not open at all.
 for bcase in "err|err fetch_failed|could not supply a token (err fetch_failed)" \
   "timeout|hang|did not answer within 1s" \
-  "closed|close|closed without an answer" \
+  "closed|close|token broker closed" \
   "unexpected|okay-DO-NOT-LEAK|sent an unexpected answer" \
   "bad-err|err Bad Code DO-NOT-LEAK|sent a malformed error" \
   "not-jwt|ok not-a-jwt-DO-NOT-LEAK|did not send a JWT" \
@@ -876,6 +876,24 @@ else
   fail "oidc-subshell-timeout-late-answer-closes-fd" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
 fi
 assert_oidc_hidden "oidc-subshell-timeout"
+
+# The same out-of-step check runs before the CLI gets the fd: a late answer
+# waiting on it fails the call, closes the fd and starts no CLI.
+CASE_BROKER="delay 2 ok ${OIDC_TOKEN}" run_case oidc-cli-pending-data '
+  export JIRA_API_URL="${TEST_GATEWAY}"
+  jira_auth_select "" FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
+  _JIRA_AUTH_OIDC_TIMEOUT=1
+  out="$(jira_auth_curl "" "" "${JIRA_API_URL}/rest/api/3/myself")" || echo first=refused
+  sleep 2
+  jira_auth_fullsend fullsend "" "" issues get || echo cli=refused
+'
+if grep -qx "first=refused" "${CASE_OUT}" && grep -qx "cli=refused" "${CASE_OUT}" \
+  && grep -qF "sent data nobody asked for" "${CASE_ERR}" \
+  && [[ ! -f "${CASE_DIR}/fullsend-argv.log" ]]; then
+  pass "oidc-cli-refused-on-pending-data"
+else
+  fail "oidc-cli-refused-on-pending-data" "rc=${CASE_RC}; $(cat "${CASE_OUT}" "${CASE_ERR}")"
+fi
 
 # A broker fd value with surrounding whitespace is trimmed, as by
 # jira_auth_select, so jira_auth_drop_oidc_fd still closes it.

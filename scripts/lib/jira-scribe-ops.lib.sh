@@ -23,6 +23,10 @@
 # --tracker jira --fullsend-dir` (fullsend#7083 / fullsend#9078). The post-script
 # validates this at preflight time via tracker_validate_create.
 #
+# Scribe has no Jira oidc support yet: a token broker fd
+# (FULLSEND_JIRA_OIDC_TOKEN_FD) is refused here. pre-scribe and post-scribe
+# close one before anything else runs and set _SCRIBE_JIRA_OIDC_FD_SEEN.
+#
 # Expected env vars:
 #   JIRA_BASE_URL          — Jira Cloud base URL (https://<site>.atlassian.net)
 #   JIRA_TOKEN             — Jira API token. Or, instead of it:
@@ -31,10 +35,6 @@
 #                            REST calls then use an access token minted on
 #                            the runner and need JIRA_API_URL. Setting both
 #                            modes fails.
-#
-# Scribe has no Jira oidc support yet: a token broker fd
-# (FULLSEND_JIRA_OIDC_TOKEN_FD) is refused here, and pre-scribe closes one
-# before anything else runs.
 #   FULLSEND_DIR           — .fullsend directory whose config.yaml holds
 #                            tracker.jira, for `fullsend issues create`
 #   SCRIBE_JIRA_PROJECT    — Jira project key that backlog reads and new
@@ -66,7 +66,7 @@ JIRA_SCRIBE_OPS_SH_LOADED=1
 # shellcheck source=jira-auth.lib.sh
 source "${SCRIPT_DIR}/lib/jira-auth.lib.sh"
 _scribe_jira_fd="${FULLSEND_JIRA_OIDC_TOKEN_FD:-}"
-if [[ -n "${_scribe_jira_fd//[[:space:]]/}" ]]; then
+if [[ -n "${_scribe_jira_fd//[[:space:]]/}" || -n "${_SCRIBE_JIRA_OIDC_FD_SEEN:-}" ]]; then
   echo "ERROR: scribe has no Jira oidc support yet; set JIRA_TOKEN, or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET" >&2
   exit 1
 fi

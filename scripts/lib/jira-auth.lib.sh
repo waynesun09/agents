@@ -145,6 +145,12 @@ _jira_auth_select_now() {
       echo "ERROR: FULLSEND_JIRA_OIDC_TOKEN_FD must be a file descriptor number from 3 up" >&2
       return 1
     fi
+    # The out-of-step check (_jira_auth_oidc_check_pending) needs read -t 0,
+    # which bash 4 added. Fail closed on an older bash.
+    if (( BASH_VERSINFO[0] < 4 )); then
+      echo "ERROR: FULLSEND_JIRA_OIDC_TOKEN_FD needs bash 4 or later" >&2
+      return 1
+    fi
   fi
   if [[ -n "${_jas_token}" && ( -n "${_jas_id}" || -n "${_jas_secret}" ) ]]; then
     echo "ERROR: set either FULLSEND_JIRA_TOKEN (JIRA_TOKEN) or FULLSEND_JIRA_CLIENT_ID and FULLSEND_JIRA_CLIENT_SECRET, not both" >&2
@@ -275,6 +281,20 @@ jira_auth_drop_oidc_fd() {
   _JIRA_AUTH_OIDC_FD=""
 }
 
+# Fail when data is waiting on the broker fd before a request: it is a late
+# answer to an earlier request (for example one that timed out in a command
+# substitution, which closed only that subshell's copy of the fd), so the
+# stream is out of step. Close the fd and fail. read -t 0 needs bash 4 or
+# later; jira_auth_select refuses the broker fd on an older bash.
+_jira_auth_oidc_check_pending() {
+  local fd="${_JIRA_AUTH_OIDC_FD}"
+  if read -r -t 0 <&"${fd}" 2>/dev/null; then
+    jira_auth_drop_oidc_fd
+    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
+    return 1
+  fi
+}
+
 # Ask the broker for one token and store it in the caller's local "tok".
 # Called with xtrace off, by _jira_auth_oidc_curl only. Sends the request
 # ("token", or "refresh" to force a refetch, which the broker may answer
@@ -283,16 +303,8 @@ jira_auth_drop_oidc_fd() {
 # "ok <jwt>". The answer line is never printed.
 _jira_auth_oidc_fetch() {
   _jira_auth_oidc_fd_open || return 1
+  _jira_auth_oidc_check_pending || return 1
   local fd="${_JIRA_AUTH_OIDC_FD}" line="" rc=0 code
-  # Data waiting before a request is a late answer to an earlier one (for
-  # example one that timed out in a command substitution, which closed only
-  # that subshell's copy): the stream is out of step. Close it and fail.
-  if read -r -t 0 <&"${fd}" 2>/dev/null; then
-    eval "exec ${fd}<&-"
-    _JIRA_AUTH_OIDC_FD=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent data nobody asked for; closing it" >&2
-    return 1
-  fi
   if ! { printf '%s\n' "$1" >&"${fd}"; } 2>/dev/null; then
     echo "ERROR: could not send a request to the FULLSEND_JIRA_OIDC_TOKEN_FD token broker" >&2
     return 1
@@ -302,14 +314,17 @@ _jira_auth_oidc_fetch() {
     # A late answer would be read as the reply to the next request, so the
     # broker is not asked again: close the fd.
     line=""
-    eval "exec ${fd}<&-"
-    _JIRA_AUTH_OIDC_FD=""
+    jira_auth_drop_oidc_fd
     echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker did not answer within ${_JIRA_AUTH_OIDC_TIMEOUT}s; closing it" >&2
     return 1
   fi
   if (( rc != 0 )); then
+    if [[ -z "${line}" ]]; then
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed" >&2
+    else
+      echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker sent an incomplete answer" >&2
+    fi
     line=""
-    echo "ERROR: the FULLSEND_JIRA_OIDC_TOKEN_FD token broker closed without an answer" >&2
     return 1
   fi
   case "${line}" in
@@ -436,7 +451,7 @@ _jira_auth_oidc_curl() {
       return 1
     fi
     (
-      eval "exec ${_JIRA_AUTH_OIDC_FD}<&-"
+      jira_auth_drop_oidc_fd
       exec curl -q --proto =https \
         --config <(printf 'header = "Authorization: Bearer %s"\n' "${tok}") \
         --dump-header "${hdr}" "$@"
@@ -608,7 +623,7 @@ jira_auth_fullsend() {
       xtrace=1
       set +x
     fi
-    if _jira_auth_check_gateway && _jira_auth_oidc_fd_open; then
+    if _jira_auth_check_gateway && _jira_auth_oidc_fd_open && _jira_auth_oidc_check_pending; then
       (
         unset FULLSEND_JIRA_TOKEN FULLSEND_JIRA_EMAIL FULLSEND_JIRA_CLIENT_ID FULLSEND_JIRA_CLIENT_SECRET
         FULLSEND_JIRA_OIDC_TOKEN_FD="${_JIRA_AUTH_OIDC_FD}" "${bin}" "$@"
