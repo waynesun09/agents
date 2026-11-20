@@ -6,7 +6,8 @@ name: behaviour-github-emulator
 # mint) is made for the run. fullsend's
 # e2e/behaviour/github-emulator/run-job.sh starts the stack and runs the
 # suite with BT_SUITE=agents. Require only the aggregate
-# behaviour-github-emulator check.
+# behaviour-github-emulator check. It runs beside behaviour-tests.yml, which
+# keeps the scenarios that need a real model (review/custom-persona.feature).
 
 on:
   pull_request:
@@ -15,10 +16,11 @@ on:
   merge_group:
   workflow_dispatch:
     inputs:
+      # No defaults: an empty fullsend builds fullsend-ai/fullsend main, an
+      # empty features runs the shards.
       fullsend:
-        description: fullsend revision that runs the suite, as owner/repo@sha (40 hex)
-        default: waynesun09/fullsend@b4c4445e8ba4385f0941bc335bd573e4ef586d19
-      # No defaults: an empty input runs the shards.
+        description: fullsend revision that runs the suite, as owner/repo@sha (40 hex); empty uses fullsend-ai/fullsend main
+
       features:
         description: Space-separated godog paths under behaviour/ (e.g. features/fix.feature) run as one custom shard
       workers:
@@ -40,16 +42,44 @@ env:
   # marker the model computes, so it needs real inference and stays in
   # behaviour-tests.yml.
   DEFAULT_CAPABILITIES: applier-branch-namespace
-  # The fullsend revision whose run-job.sh and behaviour framework run this
-  # suite, as owner/repo@sha; a dispatch can override it. Bump on purpose,
-  # like an action pin. The github-emulator release is not pinned here: it
-  # is read from that fullsend's own behaviour-github-emulator.yml, so the
-  # two suites always run against the same emulator.
-  DEFAULT_FULLSEND: waynesun09/fullsend@b4c4445e8ba4385f0941bc335bd573e4ef586d19 # emu-agents-suite (fork-only validation)
+  # fullsend's run-job.sh and behaviour framework run this suite from
+  # fullsend main, not the go.mod pin, so the agents are checked against
+  # the fullsend they will next run with. A dispatch can name another
+  # revision. The github-emulator release is not pinned here: it is read
+  # from that fullsend's own behaviour-github-emulator.yml, so both suites
+  # run against the same emulator.
+  DEFAULT_FULLSEND_REPO: fullsend-ai/fullsend
 
 jobs:
+  # fullsend main resolved once, so every shard runs the same sha.
+  fullsend:
+    name: resolve fullsend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      repo: ${{ steps.resolve.outputs.repo }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve fullsend revision
+        id: resolve
+        env:
+          FULLSEND: ${{ inputs.fullsend }}
+        run: |
+          if [ -z "$FULLSEND" ]; then
+            sha=$(git ls-remote "https://github.com/${DEFAULT_FULLSEND_REPO}.git" refs/heads/main | cut -f1)
+            FULLSEND="${DEFAULT_FULLSEND_REPO}@${sha}"
+          fi
+          if ! [[ "$FULLSEND" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})$ ]]; then
+            echo "::error::fullsend must be owner/repo@<40-hex sha>, got: $FULLSEND"
+            exit 1
+          fi
+          echo "fullsend: $FULLSEND" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "repo=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "ref=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
   behaviour-github-emulator:
     name: behaviour-github-emulator (${{ matrix.shard }})
+    needs: [fullsend]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -75,23 +105,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve fullsend revision
-        id: fullsend
-        env:
-          FULLSEND: ${{ inputs.fullsend || env.DEFAULT_FULLSEND }}
-        run: |
-          if ! [[ "$FULLSEND" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})$ ]]; then
-            echo "::error::fullsend must be owner/repo@<40-hex sha>, got: $FULLSEND"
-            exit 1
-          fi
-          echo "repo=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          echo "ref=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ steps.fullsend.outputs.repo }}
-          ref: ${{ steps.fullsend.outputs.ref }}
+          repository: ${{ needs.fullsend.outputs.repo }}
+          ref: ${{ needs.fullsend.outputs.ref }}
           path: .behaviour-fullsend
           fetch-depth: 0
           persist-credentials: false
