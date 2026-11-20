@@ -13,6 +13,9 @@ on:
   merge_group:
   workflow_dispatch:
     inputs:
+      fullsend:
+        description: fullsend revision that runs the suite, as owner/repo@sha (40 hex)
+        default: waynesun09/fullsend@b4c4445e8ba4385f0941bc335bd573e4ef586d19
       # No defaults: an empty input falls back to DEFAULT_*.
       workers:
         description: Scenarios in parallel (slot pool size and godog concurrency; empty uses DEFAULT_WORKERS)
@@ -34,14 +37,11 @@ env:
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # The fullsend revision whose run-job.sh and behaviour framework run this
-  # suite. Bump on purpose, like an action pin.
-  FULLSEND_REPO: waynesun09/fullsend
-  FULLSEND_REF: b4c4445e8ba4385f0941bc335bd573e4ef586d19 # emu-agents-suite (fork-only validation)
-  # A github-emulator release: its scripts/ci-stack.sh and
-  # scripts/ci-seed-mint-apps.py run the stack, so a bump changes what
-  # every scenario runs against. Bump on purpose, like an action pin.
-  EMULATOR_REPO: fullsend-ai/github-emulator
-  EMULATOR_REF: c70f705a1a8c0888975ef3723ba913a2166277fa # 2026.11.20.1
+  # suite, as owner/repo@sha; a dispatch can override it. Bump on purpose,
+  # like an action pin. The github-emulator release is not pinned here: it
+  # is read from that fullsend's own behaviour-github-emulator.yml, so the
+  # two suites always run against the same emulator.
+  DEFAULT_FULLSEND: waynesun09/fullsend@b4c4445e8ba4385f0941bc335bd573e4ef586d19 # emu-agents-suite (fork-only validation)
 
 jobs:
   behaviour-github-emulator:
@@ -55,20 +55,47 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Resolve fullsend revision
+        id: fullsend
+        env:
+          FULLSEND: ${{ inputs.fullsend || env.DEFAULT_FULLSEND }}
+        run: |
+          if ! [[ "$FULLSEND" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)@([0-9a-f]{40})$ ]]; then
+            echo "::error::fullsend must be owner/repo@<40-hex sha>, got: $FULLSEND"
+            exit 1
+          fi
+          echo "repo=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "ref=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout fullsend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ env.FULLSEND_REPO }}
-          ref: ${{ env.FULLSEND_REF }}
+          repository: ${{ steps.fullsend.outputs.repo }}
+          ref: ${{ steps.fullsend.outputs.ref }}
           path: .behaviour-fullsend
           fetch-depth: 0
           persist-credentials: false
 
+      # The emulator release fullsend's own behaviour job pins.
+      - name: Read the emulator pin from fullsend
+        id: emulator
+        run: |
+          wf=.behaviour-fullsend/.github/workflows/behaviour-github-emulator.yml
+          repo=$(sed -nE 's/^  EMULATOR_REPO: ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)( .*)?$/\1/p' "$wf")
+          ref=$(sed -nE 's/^  EMULATOR_REF: ([0-9a-f]{40})( .*)?$/\1/p' "$wf")
+          if [ -z "$repo" ] || [ -z "$ref" ] || [[ "$repo$ref" == *$'\n'* ]]; then
+            echo "::error::no single EMULATOR_REPO/EMULATOR_REF pin in $wf"
+            exit 1
+          fi
+          echo "Emulator ${repo}@${ref} (from $wf)"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout github-emulator
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ env.EMULATOR_REPO }}
-          ref: ${{ env.EMULATOR_REF }}
+          repository: ${{ steps.emulator.outputs.repo }}
+          ref: ${{ steps.emulator.outputs.ref }}
           path: .emulator
           persist-credentials: false
 
