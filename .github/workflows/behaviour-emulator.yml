@@ -30,10 +30,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # As the Makefile default. applier-branch-namespace: the seeded
-  # fullsend-ai/agents main enforces it. review-skill-overrides: the pinned
-  # fullsend stages skill file overrides (review/custom-persona.feature).
-  DEFAULT_CAPABILITIES: applier-branch-namespace,review-skill-overrides
+  # applier-branch-namespace: the seeded fullsend-ai/agents main enforces it.
+  # Not review-skill-overrides (the Makefile default has it): the scenario it
+  # gates, review/custom-persona.feature, asserts the claude runtime and a
+  # marker the model computes, so it needs real inference and stays in
+  # behaviour-tests.yml.
+  DEFAULT_CAPABILITIES: applier-branch-namespace
   DEFAULT_WORKERS: "6"
   DEFAULT_RUNNERS: "12"
   # The fullsend revision whose run-job.sh and behaviour framework run this
